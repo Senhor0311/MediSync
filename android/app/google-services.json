@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1017272716947",
+    "project_id": "medisync-v3",
+    "storage_bucket": "medisync-v3.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1017272716947:android:25167fa194e48e580e0766",
+        "android_client_info": {
+          "package_name": "com.leandroamaro.medisync_v3"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDKXEQ71tpWJuewcKLVPfQ2ekqt9VnSJ4I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
