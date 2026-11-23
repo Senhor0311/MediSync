@@ -1,0 +1,2360 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function verified() {
+      return signedIn() && request.auth.token.email_verified == true
+        && request.auth.token.email is string;
+    }
+
+    // Firebase-issued reserved claims, never profile fields or client flags.
+    // auth_time measures total authentication age, not human inactivity.
+    function recentAuthentication(seconds) {
+      let authenticatedAt = request.auth.token.auth_time;
+      let now = request.time.toMillis() / 1000;
+      return authenticatedAt is int && authenticatedAt <= now
+        && authenticatedAt > now - seconds;
+    }
+    function staffAuthentication() {
+      // Callers already enforce activeUser/verified. Avoid repeating the full
+      // identity validator inside each reciprocal write's expression budget.
+      return recentAuthentication(28800)
+        && request.auth.token.firebase.sign_in_second_factor == 'totp';
+    }
+
+    function activeUser() {
+      let user = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return verified()
+        && user.uid == request.auth.uid && user.status == 'active'
+        && user.consentAt is timestamp
+        && user.noticeVersion == 'draft-stage3-2026-09-24';
+    }
+
+    function activeClinic(clinicId) {
+      let clinic = get(/databases/$(database)/documents/clinics/$(clinicId)).data;
+      return clinic.clinicId == clinicId && clinic.status == 'active';
+    }
+
+    // These documents can only be provisioned and removed by a trusted Console operator.
+    function platformAdmin() {
+      let platform = get(/databases/$(database)/documents/platform_admins/$(request.auth.uid)).data;
+      return activeUser() && recentAuthentication(900)
+        && request.auth.token.firebase.sign_in_second_factor == 'totp'
+        && platform.uid == request.auth.uid && platform.status == 'active';
+    }
+
+    function membership(clinicId) {
+      return get(/databases/$(database)/documents/clinic_memberships/$(clinicId)/members/$(request.auth.uid)).data;
+    }
+
+    function clinicMember(clinicId, role, capability) {
+      let member = membership(clinicId);
+      return activeUser() && recentAuthentication(role == 'clinic_admin' ? 900 : 28800)
+        && request.auth.token.firebase.sign_in_second_factor == 'totp' && activeClinic(clinicId)
+        && member.clinicId == clinicId && member.userId == request.auth.uid
+        && member.status == 'active' && member.staffRole == role
+        && capability in member.permissions;
+    }
+
+    function clinicAdmin(clinicId, capability) {
+      return clinicMember(clinicId, 'clinic_admin', capability);
+    }
+
+    function practitioner(clinicId) {
+      let member = membership(clinicId);
+      return activeUser() && staffAuthentication() && activeClinic(clinicId)
+        && member.clinicId == clinicId && member.userId == request.auth.uid
+        && member.status == 'active' && member.staffRole in ['doctor', 'specialist']
+        && 'operational.read' in member.permissions;
+    }
+
+    // A trusted grant is insufficient after its clinical source is cancelled,
+    // removed or mismatched. Legacy broad/assignment grants confer no authority;
+    // no client may create care relationships or patient consent controls.
+    function careAppointmentSource(id, clinicId, patientId) {
+      let source = get(/databases/$(database)/documents/appointments/$(id)).data;
+      return source.appointmentId == id && source.clinicId == clinicId
+        && source.patientId == patientId
+        && source.status in ['called', 'completed'];
+    }
+
+    function appointmentCareSource(relationship) {
+      let source = get(/databases/$(database)/documents/appointments/$(relationship.sourceId)).data;
+      return source.appointmentId == relationship.sourceId
+        && source.clinicId == relationship.clinicId && source.patientId == relationship.patientId
+        && source.status in ['called', 'completed']
+        && source.providerId == relationship.practitionerId;
+    }
+
+    function referralCareSource(relationship) {
+      let source = get(/databases/$(database)/documents/referrals/$(relationship.sourceId)).data;
+      let appointment = get(/databases/$(database)/documents/appointments/$(source.sourceAppointmentId)).data;
+      // New named referrals use only their derived accepted context. A legacy
+      // manually issued grant must not reopen completed/expired new referrals.
+      return !source.keys().hasAny(['destinationClinicId'])
+        && source.referralId == relationship.sourceId
+        && source.clinicId == relationship.clinicId
+        && source.patientId == relationship.patientId
+        && (source.specialistId == relationship.practitionerId
+          || source.referringDoctorId == relationship.practitionerId)
+        && source.status in ['pending', 'accepted', 'completed']
+        && appointment.appointmentId == source.sourceAppointmentId
+        && appointment.clinicId == relationship.clinicId
+        && appointment.patientId == relationship.patientId
+        && appointment.providerId == source.referringDoctorId
+        && appointment.status in ['called', 'completed'];
+    }
+
+    function currentCareSource(relationship) {
+      return relationship.sourceType == 'appointment' ? appointmentCareSource(relationship)
+        : relationship.sourceType == 'referral' && referralCareSource(relationship);
+    }
+
+    function care(clinicId, patientId, sourceType, sourceId) {
+      return sourceType == 'referral' && derivedReferralCare(clinicId, patientId, sourceId)
+        || careFor(clinicId, patientId, request.auth.uid, sourceType, sourceId);
+    }
+
+    function referralDestination(data) {
+      return data.get('destinationClinicId', data.clinicId);
+    }
+
+    // A reservation alone never renews clinical access. Patient approval is
+    // embedded in the protected referral. Every later appointment mutation
+    // must atomically revoke it, avoiding an extra clinical-read lookup.
+    function approvedSpecialistVisitWindow(data) {
+      let window = data.visitAccess;
+      return data.status == 'accepted' && window.status == 'active'
+        && window.consentVersion == data.consentVersion && request.time < window.expiresAt;
+    }
+    function referralClinicalWindow(data) {
+      return data.status == 'pending'
+        ? request.time < data.createdAt + duration.value(24,'h')
+        : data.get('visitAccessRevokedAt',timestamp.value(0)) >= data.get('visitAccess',{}).get('approvedAt',data.decisionAt) ? false
+        : data.keys().hasAny(['visitAccess']) ? approvedSpecialistVisitWindow(data)
+        : request.time < data.decisionAt + duration.value(24,'h');
+    }
+    function patientVisitApproval(before,after) {
+      let appointment = get(/databases/$(database)/documents/specialist_appointments/$(before.referralId)).data;
+      let consent = get(/databases/$(database)/documents/patient_controls/$(before.patientId)).data;
+      let window = after.visitAccess;
+      return activeUser() && before.patientId == request.auth.uid
+        && after.diff(before).affectedKeys().hasOnly(['visitAccess'])
+        && before.status == 'accepted'
+        && window.keys().hasOnly(['appointmentRevision','consentVersion','status','approvedAt','expiresAt'])
+        && window.keys().hasAll(['appointmentRevision','consentVersion','status','approvedAt','expiresAt'])
+        && (window.status == 'revoked' && before.visitAccess.status == 'active'
+          && window.diff(before.visitAccess).affectedKeys().hasOnly(['status'])
+          || window.status == 'active' && window.approvedAt == request.time
+            && appointment.status == 'booked' && window.appointmentRevision == appointment.revision
+            && appointment.patientId == before.patientId && appointment.providerId == before.specialistId
+            && appointment.referralId == before.referralId && appointment.clinicId == referralDestination(before)
+            && activeSpecialist(appointment.clinicId,appointment.providerId)
+            && request.time >= appointment.startAt - duration.value(2,'h')
+            && request.time <= appointment.endAt + duration.value(2,'h')
+            && window.expiresAt is timestamp && window.expiresAt > request.time
+            && window.expiresAt <= request.time + duration.value(24,'h')
+            && window.expiresAt <= appointment.startAt + duration.value(24,'h')
+            && consent.status == 'consented' && window.consentVersion == consent.consentVersion
+            && window.consentVersion == before.consentVersion);
+    }
+
+    // New referrals share the reason and this referral's follow-up records only.
+    // No source record or whole-history access follows from clinic membership.
+    function namedReferralAccess(data) {
+      let patient = get(/databases/$(database)/documents/users/$(data.patientId)).data;
+      let controls = get(/databases/$(database)/documents/patient_controls/$(data.patientId)).data;
+      return data.keys().hasAny(['destinationClinicId'])
+        && data.specialistId == request.auth.uid
+        && activeSpecialist(data.destinationClinicId, request.auth.uid)
+        && patient.uid == data.patientId && patient.status == 'active'
+        && controls.patientId == data.patientId && controls.status == 'consented'
+        && controls.consentVersion is int && controls.consentVersion > 0
+        && controls.consentVersion == data.consentVersion
+        && referralClinicalWindow(data)
+        && referralSource(data)
+        && activeDoctor(data.clinicId, data.referringDoctorId);
+    }
+
+    function derivedReferralCare(clinicId, patientId, id) {
+      let referral = get(/databases/$(database)/documents/referrals/$(id)).data;
+      return referral.keys().hasAny(['destinationClinicId']) && referral.patientId == patientId
+        && referralDestination(referral) == clinicId
+        && referral.status == 'accepted'
+        && referral.decisionAt <= request.time
+        && namedReferralAccess(referral);
+    }
+
+    function careFor(clinicId, patientId, providerId, sourceType, sourceId) {
+      let relationship = get(/databases/$(database)/documents/care_relationships/$(clinicId)/patients/$(patientId)/practitioners/$(providerId)/encounters/$(sourceType + '-' + sourceId)).data;
+      let patient = get(/databases/$(database)/documents/users/$(patientId)).data;
+      let consent = get(/databases/$(database)/documents/patient_controls/$(patientId)).data;
+      return relationship.clinicId == clinicId
+        && relationship.patientId == patientId
+        && relationship.practitionerId == providerId
+        && relationship.sourceType == sourceType && relationship.sourceId == sourceId
+        && sourceType in ['appointment', 'referral'] && validId(sourceId)
+        && patient.uid == patientId && patient.status == 'active'
+        && consent.patientId == patientId && consent.status == 'consented'
+        && relationship.consentVersion == consent.consentVersion
+        && consent.consentVersion is int && consent.consentVersion > 0
+        && relationship.status == 'active'
+        && relationship.startsAt is timestamp
+        && relationship.expiresAt is timestamp
+        && relationship.expiresAt <= relationship.startsAt + duration.value(24, 'h')
+        && relationship.startsAt <= request.time
+        && request.time < relationship.expiresAt
+        && currentCareSource(relationship);
+    }
+
+    function patientOwner(data) {
+      return data.patientId == request.auth.uid;
+    }
+
+    match /care_relationships/{clinicId}/patients/{patientId}/practitioners/{uid}/encounters/{encounterId} {
+      allow get: if activeUser() && (request.auth.uid == patientId || request.auth.uid == uid && practitioner(clinicId)
+        && resource.data.practitionerId == uid
+        && careFor(clinicId, patientId, uid, resource.data.sourceType, resource.data.sourceId));
+      function patientAppointmentApproval(data) {
+        let source = get(/databases/$(database)/documents/appointments/$(data.sourceId)).data;
+        let consent = get(/databases/$(database)/documents/patient_controls/$(patientId)).data;
+        return activeUser() && request.auth.uid == patientId
+          && data.keys().hasOnly(['clinicId','patientId','practitionerId','status','startsAt','expiresAt','sourceType','sourceId','consentVersion'])
+          && data.clinicId == clinicId && data.patientId == patientId && data.practitionerId == uid
+          && data.sourceType == 'appointment' && encounterId == 'appointment-' + data.sourceId
+          && source.appointmentId == data.sourceId && source.clinicId == clinicId
+          && source.patientId == patientId && source.providerId == uid && source.status in ['called','completed']
+          && activeDoctor(clinicId, uid) && consent.patientId == patientId && consent.status == 'consented'
+          && data.consentVersion == consent.consentVersion && data.status == 'active'
+          && data.startsAt == request.time && data.expiresAt is timestamp
+          && data.expiresAt > request.time && data.expiresAt <= request.time + duration.value(24,'h');
+      }
+      allow create, update: if patientAppointmentApproval(request.resource.data);
+      allow list, delete: if false;
+    }
+    match /patient_controls/{patientId} {
+      function ownControl(data) {
+        return activeUser() && request.auth.uid == patientId
+          && data.keys().hasOnly(['patientId','status','consentVersion','updatedAt'])
+          && data.patientId == patientId && data.status in ['consented','withdrawn']
+          && data.consentVersion is int && data.updatedAt == request.time;
+      }
+      allow get: if activeUser() && request.auth.uid == patientId;
+      allow create: if ownControl(request.resource.data) && request.resource.data.consentVersion == 1;
+      allow update: if ownControl(request.resource.data) && request.resource.data.consentVersion == resource.data.consentVersion + 1;
+      allow list, delete: if false;
+    }
+
+    function practitionerRead(data) {
+      // Legacy operational documents are not an encounter-grant contract.
+      return false;
+    }
+
+    function practitionerSummaryRead(data) {
+      return data.encounterType == 'referral' && activeUser()
+          && derivedReferralCare(data.clinicId,data.patientId,data.encounterId)
+        || practitioner(data.clinicId)
+          && careFor(data.clinicId,data.patientId,request.auth.uid,data.encounterType,data.encounterId);
+    }
+
+    function recordMetadata(data, id) {
+      return validId(id) && data.recordId == id
+        && validId(data.clinicId) && validId(data.patientId)
+        && validId(data.authorId)
+        && data.encounterType in ['appointment', 'referral']
+        && validId(data.encounterId)
+        && data.status == 'final'
+        && data.recordType in ['visit', 'follow_up']
+        && data.patientVisible is bool
+        && data.revision is int && data.revision >= 1 && data.revision <= 1000
+        && (data.revision == 1 && !data.keys().hasAny(['supersedesId'])
+          && data.get('rootRecordId', id) == id
+          || data.revision > 1 && validId(data.rootRecordId) && validId(data.supersedesId))
+        && data.get('dateSource', 'legacy-preserved') in ['encounter','legacy-preserved']
+        && data.visitAt is timestamp
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function summaryProjectionShape(data) {
+      return data.keys().hasOnly([
+        'recordId', 'clinicId', 'patientId', 'authorId', 'status',
+        'recordType', 'patientVisible', 'revision', 'visitAt', 'encounterType', 'encounterId',
+        'createdAt', 'updatedAt', 'rootRecordId', 'supersedesId', 'dateSource'
+      ]);
+    }
+    function validSummary(data, id) {
+      return summaryProjectionShape(data) && data.keys().hasAll([
+          'recordId', 'clinicId', 'patientId', 'authorId', 'status',
+          'recordType', 'patientVisible', 'revision', 'visitAt', 'encounterType', 'encounterId',
+          'createdAt', 'updatedAt'
+        ]) && recordMetadata(data, id);
+    }
+
+    function validClinicalItems(items) {
+      return items is list && items.size() <= 1
+        && (items.size() == 0 || textWithin(items[0], 1, 200));
+    }
+
+    function validRecord(data, id) {
+      return data.keys().hasOnly([
+        'recordId', 'clinicId', 'patientId', 'authorId', 'status',
+        'recordType', 'patientVisible', 'revision', 'visitAt', 'encounterType', 'encounterId',
+        'createdAt', 'updatedAt', 'content', 'rootRecordId', 'supersedesId', 'dateSource'
+      ])
+        && data.keys().hasAll([
+          'recordId', 'clinicId', 'patientId', 'authorId', 'status',
+          'recordType', 'patientVisible', 'revision', 'visitAt', 'encounterType', 'encounterId',
+          'createdAt', 'updatedAt', 'content'
+        ]) && recordMetadata(data, id)
+        && (encrypted(data.content, data.patientVisible ? [data.authorId, data.patientId] : [data.authorId]) || legacyContent(data.content));
+    }
+
+    function legacyContent(content) {
+      return content is map
+        && content.keys().hasOnly([
+          'notes', 'diagnoses', 'prescriptions', 'medications',
+          'labResultMetadata', 'documentRefs'
+        ])
+        && content.keys().hasAll([
+          'notes', 'diagnoses', 'prescriptions', 'medications',
+          'labResultMetadata', 'documentRefs'
+        ])
+        && textWithin(content.notes, 0, 5000)
+        && validClinicalItems(content.diagnoses)
+        && validClinicalItems(content.prescriptions)
+        && validClinicalItems(content.medications)
+        && validClinicalItems(content.labResultMetadata)
+        && content.documentRefs == [];
+    }
+
+    function cipherBox(box) {
+      let b = box;
+      // keys() and matches() are type-specific; wrong types fail closed.
+      return b.keys().hasOnly(['v','alg','nonce','ct','tag'])
+        && b.v == 1 && b.alg == 'A256GCM'
+        && b.nonce.matches('^[A-Za-z0-9_-]{16}$') && b.tag.matches('^[A-Za-z0-9_-]{22}==$')
+        && b.ct.matches('^[A-Za-z0-9_-]+={0,2}$') && b.ct.size() <= 60000;
+    }
+    function envelope(value) {
+      // Two decimal key-version digits (01..20), then 108 bytes encoded base64url:
+      // X25519 public32 + salt16 + nonce12 + encrypted key32 + authenticated tag16.
+      // Every byte and version is bounded; clients authenticate all components.
+      return value.matches('^(0[1-9]|1[0-9]|20)[A-Za-z0-9_-]{144}$');
+    }
+    function encrypted(value, recipients) {
+      let v = value;
+      let envelopes = v.envelopes;
+      let expected = recipients;
+      return v.keys().hasOnly(['format','payload','envelopes'])
+        && v.format == 'medisync-clinical-v1' && cipherBox(v.payload)
+        && envelopes.keys().hasOnly(expected)
+        && envelopes.keys().hasAll(expected)
+        && envelope(envelopes[expected[0]])
+        && (expected.size() < 2 || envelope(envelopes[expected[1]]))
+        && (expected.size() < 3 || envelope(envelopes[expected[2]]));
+    }
+    function referralEncrypted(value, data) {
+      return encrypted(value, [data.patientId, data.referringDoctorId, data.specialistId]);
+    }
+    // Login authorises ciphertext access; recovery keys never enter these rules.
+    match /crypto_profiles/{uid} {
+      function shape(data) {
+        return data.keys().hasOnly(['uid','identity','version','revision','epoch','createdAt','updatedAt'])
+          && data.uid == uid && textWithin(data.identity, 44, 44)
+          && data.version is int && data.version >= 1 && data.version <= 20
+          && data.revision is int && data.epoch is int && data.epoch >= 1
+          && data.createdAt is timestamp && data.updatedAt == request.time;
+      }
+      function paired(data) {
+        let vault = getAfter(/databases/$(database)/documents/crypto_vaults/$(uid)).data;
+        let key = getAfter(/databases/$(database)/documents/crypto_key_versions/$(uid + '-v' + string(data.version))).data;
+        return vault.revision == data.revision && vault.epoch == data.epoch
+          && key.uid == uid && key.version == data.version && key.identity == data.identity;
+      }
+      allow get: if activeUser();
+      allow create: if activeUser() && request.auth.uid == uid && shape(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.version == 1 && request.resource.data.revision == 1 && request.resource.data.epoch == 1
+        && paired(request.resource.data);
+      allow update: if activeUser() && request.auth.uid == uid && shape(request.resource.data)
+        && request.auth.token.auth_time > request.time.toMillis() / 1000 - 900
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['version','revision','epoch','updatedAt'])
+        && request.resource.data.revision == resource.data.revision + 1
+        && (request.resource.data.version == resource.data.version + 1 && request.resource.data.epoch == resource.data.epoch
+          || request.resource.data.version == resource.data.version && request.resource.data.epoch == resource.data.epoch + 1)
+        && paired(request.resource.data);
+      allow list, delete: if false;
+    }
+    match /crypto_key_versions/{id} {
+      allow get: if activeUser();
+      allow create: if activeUser() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid','version','identity','publicKey','signature'])
+        && id == request.auth.uid + '-v' + string(request.resource.data.version)
+        && textWithin(request.resource.data.publicKey, 44, 44) && textWithin(request.resource.data.signature, 88, 88)
+        && getAfter(/databases/$(database)/documents/crypto_profiles/$(request.auth.uid)).data.identity == request.resource.data.identity
+        && getAfter(/databases/$(database)/documents/crypto_profiles/$(request.auth.uid)).data.version == request.resource.data.version
+        && (!exists(/databases/$(database)/documents/crypto_profiles/$(request.auth.uid)) && request.resource.data.version == 1
+          || get(/databases/$(database)/documents/crypto_profiles/$(request.auth.uid)).data.version + 1 == request.resource.data.version);
+      allow list, update, delete: if false;
+    }
+    match /crypto_vaults/{uid} {
+      allow get: if activeUser() && request.auth.uid == uid;
+      allow create, update: if activeUser() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['uid','revision','epoch','box']) && request.resource.data.uid == uid
+        && cipherBox(request.resource.data.box)
+        && getAfter(/databases/$(database)/documents/crypto_profiles/$(uid)).data.revision == request.resource.data.revision
+        && getAfter(/databases/$(database)/documents/crypto_profiles/$(uid)).data.epoch == request.resource.data.epoch
+        && (!exists(/databases/$(database)/documents/crypto_vaults/$(uid)) || request.resource.data.revision == resource.data.revision + 1);
+      allow list, delete: if false;
+    }
+
+    function matchingSummary(data, id) {
+      let summary = getAfter(/databases/$(database)/documents/record_summaries/$(id)).data;
+      // Schemas validate both documents; only the clinical payload differs.
+      // Compare all metadata together to leave room for the real Auth token
+      // and populated clinical fields within the Rules expression budget.
+      return summary.diff(data).affectedKeys().hasOnly(['content']);
+    }
+
+    function validRecordVersion(data, id) {
+      // Historical roots remain unchanged. New versions form one atomic chain.
+      return data.keys().hasAll(['rootRecordId', 'dateSource'])
+        && versionHeadMatches(data, id)
+        && (data.revision == 1 && data.rootRecordId == id
+            && data.dateSource == 'encounter' && !data.keys().hasAny(['supersedesId'])
+          || data.revision > 1 && correctionMatches(data));
+    }
+    function encounterVisitDate(data) {
+      return data.encounterType == 'appointment'
+        ? data.visitAt == get(/databases/$(database)/documents/appointments/$(data.encounterId)).data.startAt
+        : data.visitAt == get(/databases/$(database)/documents/specialist_appointments/$(data.encounterId)).data.startAt;
+    }
+    function versionHeadMatches(data, id) {
+      let head = getAfter(/databases/$(database)/documents/record_heads/$(data.rootRecordId)).data;
+      return head.recordId == id && head.revision == data.revision && head.updatedAt == request.time;
+    }
+    function correctionMatches(data) {
+      let previous = get(/databases/$(database)/documents/medical_records/$(data.supersedesId)).data;
+      return previous.get('rootRecordId', previous.recordId) == data.rootRecordId
+        && previous.revision + 1 == data.revision
+        && previous.authorId == data.authorId && previous.clinicId == data.clinicId
+        && previous.patientId == data.patientId && previous.patientVisible == data.patientVisible
+        && previous.encounterType == data.encounterType && previous.encounterId == data.encounterId
+        && previous.recordType == data.recordType && previous.visitAt == data.visitAt
+        && data.get('dateSource','legacy-preserved') == previous.get('dateSource','legacy-preserved');
+    }
+    match /record_heads/{root} {
+      function linked() {
+        let next = getAfter(/databases/$(database)/documents/medical_records/$(request.resource.data.recordId)).data;
+        return request.resource.data.keys().hasOnly(['rootRecordId','recordId','revision','updatedAt'])
+          && request.resource.data.rootRecordId == root && next.rootRecordId == root
+          && next.revision == request.resource.data.revision && next.authorId == request.auth.uid
+          && next.createdAt == request.time && request.resource.data.updatedAt == request.time
+          && !exists(/databases/$(database)/documents/medical_records/$(next.recordId));
+      }
+      allow create: if activeUser() && linked() && (request.resource.data.revision == 1
+        || request.resource.data.revision == 2 && request.resource.data.recordId != root
+          && getAfter(/databases/$(database)/documents/medical_records/$(request.resource.data.recordId)).data.supersedesId == root
+          && get(/databases/$(database)/documents/medical_records/$(root)).data.revision == 1);
+      allow update: if activeUser() && linked() && request.resource.data.revision == resource.data.revision + 1
+        && getAfter(/databases/$(database)/documents/medical_records/$(request.resource.data.recordId)).data.supersedesId == resource.data.recordId;
+      function clinicalHeadReader() {
+        let record = get(/databases/$(database)/documents/medical_records/$(resource.data.recordId)).data;
+        return record.patientId == request.auth.uid && record.patientVisible || practitionerSummaryRead(record);
+      }
+      function headReader() {
+        let pointer = get(/databases/$(database)/documents/record_head_readers/$(root)/specialists/$(request.auth.uid));
+        return pointer == null ? clinicalHeadReader()
+          : sharedMetadataReader(pointer.data) || clinicalHeadReader();
+      }
+      allow get: if activeUser() && (resource == null || headReader());
+      // The clinical client queries one known document ID. This uses the same
+      // full clinical authority without the unrelated sharing-pointer read.
+      // Unscoped queries cannot prove this predicate; the one-row bound is strict.
+      allow list: if activeUser() && request.query.limit == 1
+        && (resource == null || clinicalHeadReader());
+      allow delete: if false;
+    }
+
+    function matchingRecord(data, id) {
+      let record = getAfter(/databases/$(database)/documents/medical_records/$(id)).data;
+      return record.diff(data).affectedKeys().hasOnly(['content', 'notes']);
+    }
+
+    function operationalRead(data) {
+      return activeUser() && (
+        patientOwner(data)
+        || clinicAdmin(data.clinicId, 'operational.read')
+        || practitionerRead(data)
+      );
+    }
+
+    function boundedQuery() {
+      return request.query.limit != null
+        && request.query.limit > 0 && request.query.limit <= 50;
+    }
+
+    function validId(id) {
+      // matches() rejects every non-string value with a denying evaluation error.
+      return id.matches('^[A-Za-z0-9-]{1,128}$');
+    }
+
+    function textWithin(value, min, max) {
+      return value is string && value.size() >= min && value.size() <= max;
+    }
+
+    function validClinic(data, clinicId) {
+      return data.keys().hasOnly([
+        'clinicId', 'name', 'category', 'publicLocation', 'contact', 'address',
+        'timezone', 'operatingHours', 'slotMinutes', 'status', 'createdBy',
+        'createdAt', 'updatedAt', 'archivedBy', 'archivedAt', 'archiveReason', 'updatedBy', 'revision'
+      ])
+        && data.keys().hasAll([
+          'clinicId', 'name', 'category', 'publicLocation', 'contact', 'address',
+          'timezone', 'operatingHours', 'slotMinutes', 'status', 'createdBy',
+          'createdAt', 'updatedAt'
+        ])
+        && data.clinicId == clinicId && validId(clinicId)
+        && textWithin(data.name, 2, 100)
+        && textWithin(data.category, 2, 60)
+        && textWithin(data.publicLocation, 2, 100)
+        && data.contact is map
+        && data.contact.keys().hasOnly(['phone', 'email'])
+        && data.contact.keys().hasAll(['phone', 'email'])
+        && textWithin(data.contact.phone, 0, 30)
+        && textWithin(data.contact.email, 0, 254)
+        && textWithin(data.address, 0, 200)
+        && data.timezone in ['Africa/Johannesburg','UTC']
+        && textWithin(data.operatingHours, 0, 160)
+        // Variable durations need an interval reservation model. Keep the
+        // setting consistent with the protected half-hour slot contract.
+        && data.slotMinutes is int && data.slotMinutes in [15,20,30,60]
+        && data.createdBy is string && validId(data.createdBy)
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && validId(data.updatedBy) && data.revision is int && data.revision >= 1
+        && (data.status == 'active'
+          && !data.keys().hasAny(['archivedBy', 'archivedAt', 'archiveReason'])
+          || data.status == 'archived'
+          && data.archivedBy is string && validId(data.archivedBy)
+          && data.archivedAt is timestamp
+          && textWithin(data.archiveReason, 10, 300));
+    }
+
+    function validDirectory(data, clinicId) {
+      return data.keys().hasOnly([
+        'clinicId', 'displayName', 'category', 'locationLabel', 'status', 'updatedAt'
+      ])
+        && data.keys().hasAll([
+          'clinicId', 'displayName', 'category', 'locationLabel', 'status', 'updatedAt'
+        ])
+        && data.clinicId == clinicId && validId(clinicId)
+        && textWithin(data.displayName, 2, 100)
+        && textWithin(data.category, 2, 60)
+        && textWithin(data.locationLabel, 2, 100)
+        && data.status in ['active', 'archived']
+        && data.updatedAt is timestamp;
+    }
+
+    function directoryMatchesClinic(data, clinicId) {
+      let directory = getAfter(/databases/$(database)/documents/clinic_directory/$(clinicId)).data;
+      return directory.clinicId == clinicId
+        && directory.displayName == data.name
+        && directory.category == data.category
+        && directory.locationLabel == data.publicLocation
+        && directory.status == data.status
+        && directory.updatedAt == data.updatedAt;
+    }
+
+    function clinicMatchesDirectory(data, clinicId) {
+      let clinic = getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data;
+      return clinic.clinicId == clinicId
+        && clinic.name == data.displayName
+        && clinic.category == data.category
+        && clinic.publicLocation == data.locationLabel
+        && clinic.status == data.status
+        && clinic.updatedAt == data.updatedAt;
+    }
+
+    function validProfile(data, uid) {
+      return data.keys().hasOnly([
+        'uid', 'displayName', 'phone', 'locale', 'status', 'createdAt', 'updatedAt',
+        'consentAt', 'noticeVersion'
+      ])
+        && data.keys().hasAll([
+          'uid', 'displayName', 'phone', 'locale', 'status', 'createdAt', 'updatedAt',
+          'consentAt', 'noticeVersion'
+        ])
+        && data.uid == uid && validId(uid)
+        && data.displayName is string
+        && data.displayName.size() > 0 && data.displayName.size() <= 100
+        && data.phone is string && data.phone.size() <= 30
+        && data.locale == 'en'
+        && data.status == 'active'
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && data.consentAt is timestamp
+        && data.noticeVersion == 'draft-stage3-2026-09-24';
+    }
+
+    match /users/{uid} {
+      // Own profile inspection is required to distinguish first signup from suspension.
+      // It grants no operational or clinical authority and no collection listing.
+      allow get: if verified() && request.auth.uid == uid;
+      // Public registration grants only self-owned patient capabilities. Staff
+      // roles live in membership documents, never in user-controlled profiles.
+      allow create: if verified() && request.auth.uid == uid
+        && validProfile(request.resource.data, uid)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.consentAt == request.time;
+      allow update: if activeUser() && request.auth.uid == uid
+        && validProfile(request.resource.data, uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['displayName', 'phone', 'locale', 'updatedAt'])
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time;
+      // Suspension changes application access only. Require a protected event pair.
+      allow update: if platformAdmin() && request.auth.uid != uid
+        && request.auth.token.auth_time > request.time.toMillis() / 1000 - 900
+        && !exists(/databases/$(database)/documents/platform_admins/$(uid))
+        && resource.data.uid == uid && resource.data.status in ['active','suspended']
+        && request.resource.data.status in ['active','suspended'] && request.resource.data.status != resource.data.status
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+        && request.resource.data.updatedAt == request.time
+        && accountStatusPair(uid,request.resource.data.status,resource.data.status);
+    }
+    function accountStatusPair(uid,status,previous) {
+      let projection=getAfter(/databases/$(database)/documents/account_status/$(uid)).data;
+      let event=getAfter(/databases/$(database)/documents/account_status_events/$(projection.eventId)).data;
+      return projection.uid == uid && projection.status == status && projection.updatedBy == request.auth.uid && projection.updatedAt == request.time
+        && event.targetId == uid && event.actorId == request.auth.uid && event.fromStatus == previous
+        && event.toStatus == status && event.statusRevision == projection.revision && event.occurredAt == request.time;
+    }
+    match /account_status/{uid} {
+      allow get: if platformAdmin();
+      allow create,update: if platformAdmin() && request.resource.data.keys().hasOnly(['uid','status','revision','eventId','updatedBy','updatedAt'])
+        && request.resource.data.uid == uid && request.resource.data.revision is int
+        && request.resource.data.revision == (exists(/databases/$(database)/documents/account_status/$(uid)) ? resource.data.revision + 1 : 1)
+        && getAfter(/databases/$(database)/documents/users/$(uid)).data.status == request.resource.data.status
+        && getAfter(/databases/$(database)/documents/users/$(uid)).data.updatedAt == request.time
+        && get(/databases/$(database)/documents/users/$(uid)).data.status != request.resource.data.status
+        && accountStatusPair(uid,request.resource.data.status,get(/databases/$(database)/documents/users/$(uid)).data.status);
+      allow list,delete: if false;
+    }
+    match /account_status_events/{id} {
+      allow get: if platformAdmin();
+      allow list: if platformAdmin() && boundedQuery();
+      allow create: if platformAdmin() && request.resource.data.keys().hasOnly(['eventId','targetId','actorId','fromStatus','toStatus','statusRevision','reason','occurredAt'])
+        && request.resource.data.eventId == id && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.occurredAt == request.time && textWithin(request.resource.data.reason,10,300)
+        && getAfter(/databases/$(database)/documents/account_status/$(request.resource.data.targetId)).data.eventId == id
+        && getAfter(/databases/$(database)/documents/users/$(request.resource.data.targetId)).data.updatedAt == request.time
+        && request.resource.data.fromStatus == get(/databases/$(database)/documents/users/$(request.resource.data.targetId)).data.status
+        && request.resource.data.toStatus == getAfter(/databases/$(database)/documents/users/$(request.resource.data.targetId)).data.status
+        && request.resource.data.fromStatus != request.resource.data.toStatus;
+      allow update,delete: if false;
+    }
+
+    match /platform_admins/{uid} {
+      allow get: if activeUser() && request.auth.uid == uid
+        && resource.data.uid == uid && resource.data.status == 'active';
+      allow write: if false;
+    }
+
+    match /clinics/{clinicId} {
+      // Full settings are private. Names/location for discovery live in the
+      // separate allow-listed directory below.
+      allow get: if activeUser() && resource.data.clinicId == clinicId
+        && (platformAdmin() || clinicAdmin(clinicId, 'operational.read'));
+      allow list: if platformAdmin() && boundedQuery();
+      allow create: if platformAdmin()
+        && validClinic(request.resource.data, clinicId)
+        && request.resource.data.status == 'active'
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.revision == 1
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && directoryMatchesClinic(request.resource.data, clinicId);
+      allow update: if activeUser() && resource.data.clinicId == clinicId
+        && validClinic(request.resource.data, clinicId)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.revision == resource.data.get('revision', 0) + 1
+        && request.resource.data.slotMinutes == resource.data.slotMinutes
+        && request.resource.data.timezone == resource.data.timezone
+        && (
+          (resource.data.status == 'active'
+            && request.resource.data.status == 'active'
+            && (platformAdmin() || clinicAdmin(clinicId, 'operational.read'))
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['contact', 'address', 'timezone', 'operatingHours', 'slotMinutes', 'updatedAt', 'updatedBy', 'revision']))
+          || (resource.data.status == 'active' && platformAdmin()
+            && request.resource.data.status == 'active'
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['name', 'category', 'publicLocation', 'updatedAt', 'updatedBy', 'revision'])
+            && directoryMatchesClinic(request.resource.data, clinicId))
+          || (resource.data.status == 'active' && platformAdmin()
+            && request.resource.data.status == 'archived'
+            && request.resource.data.archivedBy == request.auth.uid
+            && request.resource.data.archivedAt == request.time
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'archivedBy', 'archivedAt', 'archiveReason', 'updatedAt', 'updatedBy', 'revision'])
+            && directoryMatchesClinic(request.resource.data, clinicId))
+        );
+      allow delete: if false;
+    }
+
+    match /clinic_directory/{clinicId} {
+      allow get: if activeUser() && resource.data.status == 'active';
+      allow list: if activeUser() && boundedQuery()
+        && resource.data.status == 'active';
+      allow create: if platformAdmin() && !exists(/databases/$(database)/documents/clinics/$(clinicId))
+        && validDirectory(request.resource.data, clinicId)
+        && request.resource.data.status == 'active'
+        && request.resource.data.updatedAt == request.time
+        && getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.createdBy == request.auth.uid
+        && getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.createdAt == request.time
+        && clinicMatchesDirectory(request.resource.data, clinicId);
+      allow update: if platformAdmin()
+        && resource.data.status == 'active'
+        && validDirectory(request.resource.data, clinicId)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['displayName', 'category', 'locationLabel', 'status', 'updatedAt'])
+        && clinicMatchesDirectory(request.resource.data, clinicId);
+      allow delete: if false;
+    }
+
+    // Trusted synthetic display fixtures only. Never publish profile fields.
+    match /provider_directory/{providerId} {
+      allow get: if activeUser() && resource.data.keys().hasOnly([
+        'providerId', 'displayName', 'status', 'clinicId'
+      ]) && resource.data.providerId == providerId
+        && resource.data.status == 'active'
+        && textWithin(resource.data.displayName, 2, 100);
+      allow create, update: if clinicAdmin(request.resource.data.clinicId, 'staff.invite')
+        && request.resource.data.keys().hasOnly(['providerId','clinicId','displayName','status'])
+        && request.resource.data.providerId == providerId
+        && textWithin(request.resource.data.displayName,2,100)
+        && directoryMember(request.resource.data.clinicId, providerId, request.resource.data.status);
+      allow list, delete: if false;
+    }
+    function directoryMember(clinicId, uid, status) {
+      let member = get(/databases/$(database)/documents/clinic_memberships/$(clinicId)/members/$(uid)).data;
+      return member.clinicId == clinicId && member.userId == uid && member.staffRole in ['doctor','specialist']
+        && (status == 'active' && member.status == 'active' || status == 'inactive' && member.status in ['active','suspended']);
+    }
+    function listingWrite(data, listingId, role, uid) {
+      let member = get(/databases/$(database)/documents/clinic_memberships/$(data.clinicId)/members/$(uid)).data;
+      return data.listingId == listingId && listingId == data.clinicId + '-' + uid
+        && clinicAdmin(data.clinicId, 'staff.invite') && member.staffRole == role
+        && textWithin(data.displayName,2,100) && directoryMember(data.clinicId,uid,data.status);
+    }
+
+    // Listings are provisioned as approved synthetic directory fixtures.
+    // Membership and clinic status are checked on every read.
+    match /doctor_listings/{listingId} {
+      allow get: if activeUser() && resource.data.status == 'active'
+        && resource.data.listingId == listingId
+        && providerAccountActive(resource.data.providerId)
+        && activeDoctor(resource.data.clinicId, resource.data.providerId);
+      allow list: if activeUser() && boundedQuery()
+        && resource.data.status == 'active'
+        && activeClinic(resource.data.clinicId);
+      allow create, update: if request.resource.data.keys().hasOnly(['listingId','clinicId','providerId','displayName','status'])
+        && listingWrite(request.resource.data, listingId, 'doctor', request.resource.data.providerId);
+      allow delete: if false;
+    }
+
+
+    // Approved synthetic names only; the listing never grants clinical access.
+    match /specialist_listings/{listingId} {
+      allow get: if activeUser() && resource.data.listingId == listingId
+        && resource.data.status == 'active'
+        && providerAccountActive(resource.data.specialistId)
+        && activeSpecialist(resource.data.clinicId, resource.data.specialistId);
+      allow list: if activeUser() && boundedQuery()
+        && resource.data.status == 'active'
+        && activeClinic(resource.data.clinicId);
+      allow create, update: if request.resource.data.keys().hasOnly(['listingId','clinicId','specialistId','displayName','status'])
+        && listingWrite(request.resource.data, listingId, 'specialist', request.resource.data.specialistId);
+      allow delete: if false;
+    }
+
+    function validInvitation(data, inviteId) {
+      return validId(inviteId)
+        && data.keys().hasOnly([
+          'invitationId', 'clinicId', 'email', 'staffRole', 'status',
+          'createdBy', 'createdAt', 'expiresAt', 'revision'
+        ])
+        && data.keys().hasAll([
+          'invitationId', 'clinicId', 'email', 'staffRole', 'status',
+          'createdBy', 'createdAt', 'expiresAt'
+        ])
+        && data.invitationId == inviteId
+        && validId(data.clinicId)
+        && data.email is string
+        && data.email.size() >= 5 && data.email.size() <= 254
+        && data.email.matches('^[^@ ]+@[^@ ]+\\.[^@ ]+$')
+        && data.staffRole in ['clinic_admin', 'doctor', 'specialist']
+        && data.status == 'pending'
+        && data.createdBy == request.auth.uid
+        && data.createdAt == request.time
+        && data.revision == 1
+        && data.expiresAt is timestamp
+        && data.expiresAt > request.time
+        && data.expiresAt <= request.time + duration.value(7, 'd')
+        && data.email != request.auth.token.email
+        && activeClinic(data.clinicId);
+    }
+
+    function mayInvite(data) {
+      return (data.staffRole == 'clinic_admin' && platformAdmin())
+        || (data.staffRole in ['doctor', 'specialist']
+          && clinicAdmin(data.clinicId, 'staff.invite'));
+    }
+
+    function activeInviter(data) {
+      let inviter = get(/databases/$(database)/documents/users/$(data.createdBy)).data;
+      return inviter.uid == data.createdBy && inviter.status == 'active';
+    }
+
+    function platformInviter(data) {
+      let platform = get(/databases/$(database)/documents/platform_admins/$(data.createdBy)).data;
+      return platform.uid == data.createdBy && platform.status == 'active';
+    }
+
+    function clinicInviter(data) {
+      let clinic = get(/databases/$(database)/documents/clinic_memberships/$(data.clinicId)/members/$(data.createdBy)).data;
+      return clinic.userId == data.createdBy
+        && clinic.clinicId == data.clinicId
+        && clinic.staffRole == 'clinic_admin'
+        && clinic.status == 'active'
+        && 'staff.invite' in clinic.permissions;
+    }
+
+    function inviterStillAuthorised(data) {
+      return activeInviter(data)
+        && ((data.staffRole == 'clinic_admin' && platformInviter(data))
+          || (data.staffRole in ['doctor', 'specialist']
+            && clinicInviter(data)));
+    }
+
+    function acceptedMembership(data, inviteId) {
+      let member = getAfter(/databases/$(database)/documents/clinic_memberships/$(data.clinicId)/members/$(request.auth.uid)).data;
+      return member.invitationId == inviteId
+        && member.userId == request.auth.uid
+        && member.clinicId == data.clinicId
+        && member.staffRole == data.staffRole
+        && member.status == 'active'
+        && member.createdAt == request.time;
+    }
+
+    match /invitations/{inviteId} {
+      allow get: if (activeUser()
+        && resource.data.email == request.auth.token.email)
+        || (activeUser() && mayInvite(resource.data));
+      allow create: if activeUser()
+        && validInvitation(request.resource.data, inviteId)
+        && mayInvite(request.resource.data);
+      // getAfter requires this transition and the new membership in one batch.
+      allow update: if activeUser()
+        && resource.data.status == 'pending'
+        && resource.data.email == request.auth.token.email
+        && resource.data.createdBy != request.auth.uid
+        && inviterStillAuthorised(resource.data)
+        && resource.data.expiresAt > request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'acceptedBy', 'acceptedAt', 'revision'])
+        && request.resource.data.status == 'accepted'
+        && request.resource.data.acceptedBy == request.auth.uid
+        && request.resource.data.acceptedAt == request.time
+        && request.resource.data.revision == resource.data.get('revision', 0) + 1
+        && !exists(/databases/$(database)/documents/clinic_memberships/$(resource.data.clinicId)/members/$(request.auth.uid))
+        && activeClinic(resource.data.clinicId)
+        && acceptedMembership(resource.data, inviteId);
+    }
+
+    function validMember(data, clinicId, uid) {
+      return data.keys().hasOnly([
+        'clinicId', 'userId', 'staffRole', 'status', 'permissions',
+        'approvedBy', 'createdAt', 'invitationId', 'revision'
+      ])
+        && data.keys().hasAll([
+          'clinicId', 'userId', 'staffRole', 'status', 'permissions',
+          'approvedBy', 'createdAt', 'invitationId'
+        ])
+        && data.clinicId == clinicId && data.userId == uid
+        && data.status == 'active'
+        && data.createdAt == request.time
+        && data.revision == 1
+        && validId(data.invitationId)
+        && (data.staffRole == 'clinic_admin'
+          && data.permissions == ['operational.read', 'audit.read', 'staff.invite']
+          || data.staffRole in ['doctor', 'specialist']
+          && data.permissions == ['operational.read']);
+    }
+
+    function validAcceptance(data, clinicId, uid) {
+      let invite = get(/databases/$(database)/documents/invitations/$(data.invitationId)).data;
+      let accepted = getAfter(/databases/$(database)/documents/invitations/$(data.invitationId)).data;
+      return invite.status == 'pending'
+        && invite.invitationId == data.invitationId
+        && invite.clinicId == clinicId
+        && invite.staffRole == data.staffRole
+        && invite.email == request.auth.token.email
+        && invite.createdBy == data.approvedBy
+        && invite.createdBy != uid
+        && inviterStillAuthorised(invite)
+        && invite.expiresAt > request.time
+        && accepted.status == 'accepted'
+        && accepted.acceptedBy == uid
+        && accepted.acceptedAt == request.time
+        && activeClinic(clinicId);
+    }
+
+    match /clinic_memberships/{clinicId}/members/{uid} {
+      allow get: if activeUser() && request.auth.uid == uid
+        && resource.data.userId == uid
+        && resource.data.clinicId == clinicId;
+      // Clinic staff lists expose only doctor/specialist grants to a currently
+      // active admin of this exact clinic. The query must constrain staffRole.
+      allow list: if clinicAdmin(clinicId, 'staff.invite') && boundedQuery()
+        && resource.data.clinicId == clinicId
+        && resource.data.staffRole in ['doctor', 'specialist'];
+      allow create: if activeUser() && request.auth.uid == uid
+        && validMember(request.resource.data, clinicId, uid)
+        && validAcceptance(request.resource.data, clinicId, uid);
+      // Suspension preserves the approved grant and any earlier restoration.
+      // The separate scoped restoration rule cannot replace roles/permissions.
+      allow update: if clinicAdmin(clinicId, 'staff.invite')
+        && request.auth.uid != uid
+        && resource.data.userId == uid && resource.data.clinicId == clinicId
+        && resource.data.staffRole in ['doctor', 'specialist']
+        && resource.data.status == 'active'
+        && resource.data.permissions == ['operational.read']
+        && resource.data.keys().hasAll([
+          'clinicId', 'userId', 'staffRole', 'status', 'permissions',
+          'approvedBy', 'createdAt', 'invitationId'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'clinicId', 'userId', 'staffRole', 'status', 'permissions',
+          'approvedBy', 'createdAt', 'invitationId',
+          'suspendedBy', 'suspendedAt', 'suspensionReason', 'revision',
+          'restoredBy', 'restoredAt', 'restorationReason'
+          , 'roleChangedAt', 'roleChangeOperationId'
+        ])
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'suspendedBy', 'suspendedAt', 'suspensionReason', 'revision'])
+        && request.resource.data.status == 'suspended'
+        && request.resource.data.suspendedBy == request.auth.uid
+        && request.resource.data.suspendedAt == request.time
+        && request.resource.data.revision == resource.data.get('revision', 0) + 1
+        && textWithin(request.resource.data.suspensionReason, 10, 300);
+      allow update: if clinicAdmin(clinicId,'staff.invite') && request.auth.uid != uid
+        && resource.data.userId == uid && resource.data.clinicId == clinicId
+        && resource.data.staffRole in ['doctor','specialist'] && resource.data.status == 'suspended'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','restoredBy','restoredAt','restorationReason','revision'])
+        && request.resource.data.status == 'active' && request.resource.data.restoredBy == request.auth.uid
+        && request.resource.data.restoredAt == request.time
+        && request.resource.data.revision == resource.data.get('revision',0)+1
+        && textWithin(request.resource.data.restorationReason,10,300);
+      allow delete: if false;
+    }
+
+    // A collection-group query constrained to userId == the signed-in UID
+    // discovers existing grants across clinics without exposing a directory.
+    match /{path=**}/members/{memberId} {
+      allow list: if activeUser()
+        && resource.data.userId == request.auth.uid
+        && boundedQuery();
+    }
+
+    // New assignments/discovery require a globally active recipient. Existing
+    // clinical authority retains its original current-requester, membership,
+    // consent and source checks; do not repeat a target-eligibility lookup in
+    // every nested clinical validator (the Rules expression budget is shared).
+    function providerAccountActive(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.status == 'active';
+    }
+    function activeDoctor(clinicId, providerId) {
+      let member = get(/databases/$(database)/documents/clinic_memberships/$(clinicId)/members/$(providerId)).data;
+      return (request.auth.uid != providerId || staffAuthentication())
+        && activeClinic(clinicId) && member.clinicId == clinicId
+        && member.userId == providerId && member.staffRole == 'doctor'
+        && member.status == 'active' && 'operational.read' in member.permissions;
+    }
+
+    function approvedDoctor(clinicId, providerId) {
+      let listing = get(/databases/$(database)/documents/doctor_listings/$(clinicId + '-' + providerId)).data;
+      return listing.listingId == clinicId + '-' + providerId
+        && listing.clinicId == clinicId && listing.providerId == providerId
+        && listing.status == 'active';
+    }
+
+    function slotKey(data) {
+      return data.clinicId + '-' + data.providerId + '-' + string(data.startEpochMillis);
+    }
+
+    function validSlot(data, id) {
+      return data.keys().hasOnly(['clinicId', 'providerId', 'startEpochMillis',
+          'startAt', 'endAt', 'status', 'appointmentId', 'patientId', 'updatedAt'])
+        && data.keys().hasAll(['clinicId', 'providerId', 'startEpochMillis',
+          'startAt', 'endAt', 'status', 'updatedAt'])
+        && validId(data.clinicId) && validId(data.providerId)
+        && data.clinicId.size() <= 40 && data.providerId.size() <= 40
+        && data.startEpochMillis is int
+        && data.startEpochMillis > 0
+        && (data.endAt - data.startAt) in [duration.value(15,'m'),duration.value(20,'m'),duration.value(30,'m'),duration.value(60,'m')]
+        && data.startEpochMillis % ((data.endAt - data.startAt).seconds() * 1000) == 0
+        && id == slotKey(data)
+        && data.startAt == timestamp.value(data.startEpochMillis)
+        && data.endAt is timestamp
+        && data.updatedAt is timestamp
+        && (data.status in ['available', 'unavailable']
+          && !data.keys().hasAny(['appointmentId', 'patientId'])
+          || data.status == 'booked' && validId(data.appointmentId)
+          && validId(data.patientId));
+    }
+
+    function scheduleManager(clinicId, providerId) {
+      return activeUser() && activeDoctor(clinicId, providerId)
+        && (request.auth.uid == providerId
+          || clinicAdmin(clinicId, 'operational.read'));
+    }
+
+    function validAppointment(data, id) {
+      return validId(id)
+        && data.keys().hasOnly(['appointmentId', 'slotId', 'clinicId',
+          'providerId', 'patientId', 'startAt', 'endAt', 'status',
+          'createdAt', 'updatedAt', 'cancelledAt', 'queueId', 'bookedBy', 'patientKind'])
+        && data.keys().hasAll(['appointmentId', 'slotId', 'clinicId',
+          'providerId', 'patientId', 'startAt', 'endAt', 'status',
+          'createdAt', 'updatedAt'])
+        && data.appointmentId == id && validId(data.clinicId)
+        && validId(data.providerId) && validId(data.patientId)
+        && validId(data.slotId)
+        && data.startAt is timestamp && data.endAt is timestamp
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && data.get('patientKind', 'account') in ['account', 'staff_managed']
+        && (!data.keys().hasAny(['bookedBy']) || validId(data.bookedBy))
+        && (data.status == 'booked' && !data.keys().hasAny(['cancelledAt', 'queueId'])
+          || data.status == 'cancelled' && data.cancelledAt is timestamp
+            && !data.keys().hasAny(['queueId'])
+          || data.status in ['checked_in', 'check_in_cancelled', 'called', 'completed']
+            && validId(data.queueId) && !data.keys().hasAny(['cancelledAt']));
+    }
+
+    function slotMatchesAppointment(slot, appointment) {
+      return slot.clinicId == appointment.clinicId
+        && slot.providerId == appointment.providerId
+        && slot.startAt == appointment.startAt
+        && slot.endAt == appointment.endAt;
+    }
+
+    function bookingActor(clinicId, providerId, patientId) {
+      return activeUser() && (patientId == request.auth.uid
+        || clinicAdmin(clinicId, 'operational.read')
+        || request.auth.uid == providerId && activeDoctor(clinicId, providerId));
+    }
+
+    function bookingCreate(data) {
+      return bookingActor(data.clinicId, data.providerId, data.patientId)
+        && (data.get('patientKind', 'account') == 'staff_managed'
+          ? staffManagedBooking(data)
+          : data.patientId == request.auth.uid
+          || data.bookedBy == request.auth.uid
+            && get(/databases/$(database)/documents/users/$(data.patientId)).data.status == 'active')
+        && (!data.keys().hasAny(['bookedBy']) || data.bookedBy == request.auth.uid);
+    }
+
+    // Operational identities are never Firebase users, consent or clinical grants.
+    function staffPatientManager(clinicId) {
+      return clinicAdmin(clinicId, 'operational.read')
+        || clinicMember(clinicId, 'doctor', 'operational.read');
+    }
+    function staffManagedBooking(data) {
+      let patient = get(/databases/$(database)/documents/staff_patients/$(data.clinicId)/patients/$(data.patientId)).data;
+      return staffPatientManager(data.clinicId)
+        && data.bookedBy == request.auth.uid
+        && patient.patientId == data.patientId && patient.clinicId == data.clinicId
+        && patient.status == 'active';
+    }
+    function checkInActor(appointment) {
+      return appointment.get('patientKind', 'account') == 'staff_managed'
+        ? staffQueueActor(appointment.clinicId)
+        : appointment.patientId == request.auth.uid;
+    }
+    // Every caller already requires activeUser; avoid multiplying that entire
+    // check inside the three reciprocal queue writes. Membership is still exact.
+    function staffQueueActor(clinicId) {
+      let member = membership(clinicId);
+      return staffAuthentication()
+        && (member.staffRole != 'clinic_admin' || recentAuthentication(900))
+        && activeClinic(clinicId) && member.clinicId == clinicId
+        && member.userId == request.auth.uid && member.status == 'active'
+        && member.staffRole in ['clinic_admin','doctor']
+        && 'operational.read' in member.permissions;
+    }
+    match /staff_patients/{clinicId}/patients/{patientId} {
+      allow get: if staffPatientManager(clinicId);
+      allow list: if boundedQuery() && staffPatientManager(clinicId);
+      allow create: if staffPatientManager(clinicId)
+        && request.resource.data.keys().hasOnly(['patientId','clinicId','reference','label','status','createdBy','createdAt'])
+        && request.resource.data.keys().hasAll(['patientId','clinicId','reference','label','status','createdBy','createdAt'])
+        && request.resource.data.patientId == patientId && request.resource.data.clinicId == clinicId
+        && request.resource.data.reference is string
+        && request.resource.data.reference.matches('^[A-Z0-9]{4,16}$')
+        && patientId == 'guest-' + clinicId + '-' + request.resource.data.reference
+        && textWithin(request.resource.data.label, 2, 80)
+        && request.resource.data.status == 'active'
+        && request.resource.data.createdBy == request.auth.uid && request.resource.data.createdAt == request.time;
+      // Deliberately no account-link, identity rewrite, overwrite or client delete.
+      allow update, delete: if false;
+    }
+
+    function bookedSlotMatchesAppointment(data, id) {
+      let slot = getAfter(/databases/$(database)/documents/availability_slots/$(data.slotId)).data;
+      return slot.status == 'booked' && slot.appointmentId == id
+        && slot.patientId == data.patientId && slotMatchesAppointment(slot, data);
+    }
+
+    function bookedAppointmentMatchesSlot(data, slotId) {
+      let appointment = getAfter(/databases/$(database)/documents/appointments/$(data.appointmentId)).data;
+      return appointment.status == 'booked'
+        && appointment.patientId == data.patientId
+        && appointment.slotId == slotId
+        && slotMatchesAppointment(data, appointment);
+    }
+
+    function cancelledAppointmentMatchesSlot(data, slotId) {
+      let appointment = getAfter(/databases/$(database)/documents/appointments/$(data.appointmentId)).data;
+      return appointment.status == 'cancelled'
+        && appointment.cancelledAt == request.time
+        && appointment.patientId == data.patientId
+        && appointment.slotId == slotId;
+    }
+
+    function releasedSlotMatchesAppointment(data, id) {
+      let before = get(/databases/$(database)/documents/availability_slots/$(data.slotId)).data;
+      let after = getAfter(/databases/$(database)/documents/availability_slots/$(data.slotId)).data;
+      return before.status == 'booked' && before.appointmentId == id
+        && before.patientId == data.patientId
+        && after.status == 'available'
+        && !after.keys().hasAny(['appointmentId', 'patientId']);
+    }
+
+    // Queue days use a trusted fixed UTC offset. This is deliberately limited
+    // to configured synthetic clinics; Rules cannot resolve IANA/DST zones.
+    function queueConfig(clinicId) {
+      return get(/databases/$(database)/documents/queue_configs/$(clinicId)).data;
+    }
+
+    function configuredQueue(clinicId) {
+      let config = queueConfig(clinicId);
+      return activeClinic(clinicId) && config.clinicId == clinicId
+        && config.status == 'active'
+        && config.utcOffsetMinutes is int
+        && config.utcOffsetMinutes >= -720 && config.utcOffsetMinutes <= 840
+        && config.estimateMinutesPerPatient is int
+        && config.estimateMinutesPerPatient >= 1
+        && config.estimateMinutesPerPatient <= 120;
+    }
+
+    function queueDayMillis(appointment) {
+      let offset = queueConfig(appointment.clinicId).utcOffsetMinutes;
+      return (appointment.startAt + duration.value(offset, 'm')).date().toMillis()
+        - offset * 60000;
+    }
+
+    function queueStateId(appointment) {
+      return appointment.clinicId + '-' + appointment.providerId + '-'
+        + string(queueDayMillis(appointment));
+    }
+
+    function sameQueueDay(appointment) {
+      let offset = queueConfig(appointment.clinicId).utcOffsetMinutes;
+      return (appointment.startAt + duration.value(offset, 'm')).date()
+        == (request.time + duration.value(offset, 'm')).date();
+    }
+
+    function checkInWindow(appointment) {
+      return request.time >= appointment.startAt - duration.value(2, 'h')
+        && request.time <= appointment.endAt + duration.value(2, 'h');
+    }
+
+    function validQueueState(data, id) {
+      return data.keys().hasOnly(['clinicId', 'providerId', 'dayStartMillis',
+          'nextTicket', 'waiting', 'activeTicket', 'changedTicket', 'updatedAt', 'headTicket'])
+        && data.keys().hasAll(['clinicId', 'providerId', 'dayStartMillis',
+          'nextTicket', 'waiting', 'activeTicket', 'changedTicket', 'updatedAt', 'headTicket'])
+        && validId(data.clinicId) && validId(data.providerId)
+        && data.dayStartMillis is int
+        && id == data.clinicId + '-' + data.providerId + '-'
+          + string(data.dayStartMillis)
+        && data.nextTicket is int && data.nextTicket >= 2
+        && data.nextTicket <= 1001
+        && data.waiting is list && data.waiting.size() <= 100
+        && data.activeTicket is int && data.activeTicket >= 0
+        && data.changedTicket is int && data.changedTicket > 0
+        && data.headTicket is int && data.headTicket >= 1 && data.headTicket <= data.nextTicket
+        && data.updatedAt is timestamp;
+    }
+
+    function validHeadChange(before, after) {
+      return before.headTicket is int && after.headTicket is int
+          && before.headTicket >= 1 && after.headTicket <= after.nextTicket
+          && (after.headTicket == before.headTicket
+            || before.activeTicket == 0 && after.headTicket == before.headTicket + 1
+              && after.activeTicket == before.headTicket);
+    }
+
+    function skipCancelledHead(id) {
+      let before = resource.data;
+      let after = request.resource.data;
+      let entry = get(/databases/$(database)/documents/queues/$(id + '-' + string(before.headTicket))).data;
+      return before.providerId == request.auth.uid && activeDoctor(before.clinicId, request.auth.uid)
+        && before.activeTicket == 0 && before.headTicket < before.nextTicket
+        && entry.stateId == id && entry.ticket == before.headTicket && entry.status == 'cancelled'
+        && after.headTicket == before.headTicket + 1
+        && after.changedTicket == before.headTicket
+        && after.diff(before).affectedKeys().hasOnly(['headTicket', 'changedTicket', 'updatedAt']);
+    }
+
+    function queueChangeMatches(stateId, ticket, expected) {
+      let queue = getAfter(/databases/$(database)/documents/queues/$(stateId + '-' + string(ticket))).data;
+      let appointment = getAfter(/databases/$(database)/documents/appointments/$(queue.appointmentId)).data;
+      return queue.queueId == stateId + '-' + string(ticket)
+        && queue.stateId == stateId && queue.ticket == ticket
+        && queue.status == expected && queue.updatedAt == request.time
+        && appointment.appointmentId == queue.appointmentId
+        && appointment.queueId == queue.queueId
+        && appointment.patientId == queue.patientId
+        && appointment.clinicId == queue.clinicId
+        && appointment.providerId == queue.providerId
+        && appointment.updatedAt == request.time
+        && (expected == 'waiting' && appointment.status == 'checked_in'
+          || expected == 'cancelled' && appointment.status == 'check_in_cancelled'
+          || expected == 'called' && appointment.status == 'called'
+          || expected == 'completed' && appointment.status == 'completed');
+    }
+
+    function validQueue(data, id) {
+      return data.keys().hasOnly(['queueId', 'stateId', 'appointmentId',
+          'clinicId', 'providerId', 'patientId', 'ticket', 'status',
+          'checkedInAt', 'updatedAt', 'cancelledAt', 'calledAt', 'completedAt'])
+        && data.keys().hasAll(['queueId', 'stateId', 'appointmentId',
+          'clinicId', 'providerId', 'patientId', 'ticket', 'status',
+          'checkedInAt', 'updatedAt'])
+        && data.queueId == id && validId(data.stateId)
+        && validId(data.appointmentId) && validId(data.clinicId)
+        && validId(data.providerId) && validId(data.patientId)
+        && data.ticket is int && data.ticket > 0 && data.ticket <= 1000
+        && id == data.stateId + '-' + string(data.ticket)
+        && data.checkedInAt is timestamp && data.updatedAt is timestamp
+        && (data.status == 'waiting'
+          && !data.keys().hasAny(['cancelledAt', 'calledAt', 'completedAt'])
+          || data.status == 'cancelled' && data.cancelledAt is timestamp
+            && !data.keys().hasAny(['calledAt', 'completedAt'])
+          || data.status == 'called' && data.calledAt is timestamp
+            && !data.keys().hasAny(['cancelledAt', 'completedAt'])
+          || data.status == 'completed' && data.calledAt is timestamp
+            && data.completedAt is timestamp
+            && !data.keys().hasAny(['cancelledAt']));
+    }
+
+    function queueAppointmentMatches(queue) {
+      let appointment = getAfter(/databases/$(database)/documents/appointments/$(queue.appointmentId)).data;
+      return appointment.queueId == queue.queueId
+        && appointment.patientId == queue.patientId
+        && appointment.clinicId == queue.clinicId
+        && appointment.providerId == queue.providerId
+        && appointment.updatedAt == request.time
+        && (queue.status == 'waiting' && appointment.status == 'checked_in'
+          || queue.status == 'cancelled' && appointment.status == 'check_in_cancelled'
+          || queue.status == 'called' && appointment.status == 'called'
+          || queue.status == 'completed' && appointment.status == 'completed');
+    }
+
+    function queueStateMoved(queue) {
+      let before = get(/databases/$(database)/documents/queue_states/$(queue.stateId)).data;
+      let after = getAfter(/databases/$(database)/documents/queue_states/$(queue.stateId)).data;
+      return after.changedTicket == queue.ticket
+        && after.updatedAt == request.time
+        && after.clinicId == queue.clinicId
+        && after.providerId == queue.providerId
+        && (queue.status == 'cancelled'
+          && before.waiting.hasAny([queue.ticket])
+          && !after.waiting.hasAny([queue.ticket])
+          || queue.status == 'called'
+            && before.activeTicket == 0
+            && before.waiting.size() > 0
+            && before.waiting[0] == queue.ticket
+            && after.activeTicket == queue.ticket
+          || queue.status == 'completed'
+            && before.activeTicket == queue.ticket
+            && after.activeTicket == 0);
+    }
+
+    function appointmentQueueTransition(data, id) {
+      let queue = getAfter(/databases/$(database)/documents/queues/$(data.queueId)).data;
+      let beforeQueue = get(/databases/$(database)/documents/queues/$(data.queueId)).data;
+      return data.updatedAt == request.time
+        && queue.appointmentId == id && queue.patientId == data.patientId
+        && queue.clinicId == data.clinicId && queue.providerId == data.providerId
+        && queue.updatedAt == request.time
+        && (resource.data.status == 'booked'
+          && data.status == 'checked_in'
+          && checkInActor(data)
+          && data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'queueId', 'updatedAt'])
+          && configuredQueue(data.clinicId) && sameQueueDay(data)
+          && checkInWindow(data)
+          && activeDoctor(data.clinicId, data.providerId)
+          && queue.status == 'waiting' && queue.checkedInAt == request.time
+          && queue.stateId == queueStateId(data)
+          && queue.ticket == getAfter(/databases/$(database)/documents/queue_states/$(queue.stateId)).data.changedTicket
+          || resource.data.queueId == data.queueId
+            && data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'updatedAt'])
+            && (resource.data.status == 'checked_in'
+              && data.status == 'check_in_cancelled'
+              && checkInActor(data)
+              && beforeQueue.status == 'waiting' && queue.status == 'cancelled'
+              || resource.data.status == 'checked_in'
+                && data.status == 'called'
+                && data.providerId == request.auth.uid
+                && activeDoctor(data.clinicId, data.providerId)
+                && beforeQueue.status == 'waiting' && queue.status == 'called'
+              || resource.data.status == 'called'
+                && data.status == 'completed'
+                && data.providerId == request.auth.uid
+                && activeDoctor(data.clinicId, data.providerId)
+                && beforeQueue.status == 'called' && queue.status == 'completed'));
+    }
+
+    // A slot is the sole claim for a clinic, doctor and UTC half-hour. Both
+    // sides of a booking/cancellation must change in the same atomic commit.
+    match /availability_slots/{slotId} {
+      allow get: if activeUser() && validSlot(resource.data, slotId)
+        && (resource.data.status == 'available'
+            && providerAccountActive(resource.data.providerId)
+            && activeDoctor(resource.data.clinicId, resource.data.providerId)
+            && approvedDoctor(resource.data.clinicId, resource.data.providerId)
+          || scheduleManager(resource.data.clinicId, resource.data.providerId)
+          || resource.data.status == 'booked'
+            && resource.data.patientId == request.auth.uid);
+      allow list: if activeUser() && boundedQuery()
+        && (resource.data.status == 'available'
+            && providerAccountActive(resource.data.providerId)
+            && activeDoctor(resource.data.clinicId, resource.data.providerId)
+            && approvedDoctor(resource.data.clinicId, resource.data.providerId)
+          || scheduleManager(resource.data.clinicId, resource.data.providerId));
+      allow create: if validSlot(request.resource.data, slotId)
+        && request.resource.data.status in ['available', 'unavailable']
+        && request.resource.data.startAt > request.time
+        && request.resource.data.updatedAt == request.time
+        && scheduleManager(request.resource.data.clinicId, request.resource.data.providerId)
+        && request.resource.data.endAt == request.resource.data.startAt + duration.value(get(/databases/$(database)/documents/clinics/$(request.resource.data.clinicId)).data.slotMinutes,'m');
+      allow update: if validSlot(resource.data, slotId)
+        && validSlot(request.resource.data, slotId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'appointmentId', 'patientId', 'updatedAt'])
+        && request.resource.data.updatedAt == request.time
+        && resource.data.startAt > request.time
+        && (
+          resource.data.status in ['available', 'unavailable']
+            && request.resource.data.status in ['available', 'unavailable']
+            && scheduleManager(resource.data.clinicId, resource.data.providerId)
+          || resource.data.status == 'available'
+            && request.resource.data.status == 'booked'
+            && providerAccountActive(resource.data.providerId)
+            && bookingActor(resource.data.clinicId, resource.data.providerId, request.resource.data.patientId)
+            && activeDoctor(resource.data.clinicId, resource.data.providerId)
+            && approvedDoctor(resource.data.clinicId, resource.data.providerId)
+            && !exists(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId))
+            && bookedAppointmentMatchesSlot(request.resource.data, slotId)
+          || resource.data.status == 'booked'
+            && request.resource.data.status == 'available'
+            && bookingActor(resource.data.clinicId, resource.data.providerId, resource.data.patientId)
+            && cancelledAppointmentMatchesSlot(resource.data, slotId)
+        );
+      allow delete: if false;
+    }
+
+    match /appointments/{id} {
+      allow get: if resource.data.keys().hasAny(['providerId'])
+        ? activeUser() && (resource.data.patientId == request.auth.uid
+          || clinicAdmin(resource.data.clinicId, 'operational.read')
+          || resource.data.providerId == request.auth.uid
+            && activeDoctor(resource.data.clinicId, request.auth.uid))
+        : operationalRead(resource.data);
+      allow list: if boundedQuery() && activeUser()
+        && (resource.data.patientId == request.auth.uid
+          || resource.data.providerId == request.auth.uid
+            && activeDoctor(resource.data.clinicId, request.auth.uid)
+          || clinicAdmin(resource.data.clinicId, 'operational.read')
+          || practitionerRead(resource.data));
+      allow create: if activeUser() && validAppointment(request.resource.data, id)
+        && providerAccountActive(request.resource.data.providerId)
+        && request.resource.data.status == 'booked'
+        && bookingCreate(request.resource.data)
+        && request.resource.data.startAt > request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && activeDoctor(request.resource.data.clinicId, request.resource.data.providerId)
+        && approvedDoctor(request.resource.data.clinicId, request.resource.data.providerId)
+        && get(/databases/$(database)/documents/availability_slots/$(request.resource.data.slotId)).data.status == 'available'
+        && bookedSlotMatchesAppointment(request.resource.data, id);
+      allow update: if activeUser() && validAppointment(resource.data, id)
+        && validAppointment(request.resource.data, id)
+        && (resource.data.status == 'booked'
+          && resource.data.startAt > request.time
+          && request.resource.data.status == 'cancelled'
+          && bookingActor(resource.data.clinicId, resource.data.providerId, resource.data.patientId)
+          && request.resource.data.cancelledAt == request.time
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'cancelledAt', 'updatedAt'])
+          && releasedSlotMatchesAppointment(resource.data, id)
+          || appointmentQueueTransition(request.resource.data, id));
+      allow delete: if false;
+    }
+
+    // Reasons are never in broad administrative schedule documents.
+    match /private_appointment_payloads/{id} {
+      function payloadReader() {
+        let appointment = get(/databases/$(database)/documents/appointments/$(id)).data;
+        return activeUser() && validAppointment(appointment, id) && (appointment.patientId == request.auth.uid
+          || appointment.providerId == request.auth.uid
+            && activeDoctor(appointment.clinicId, request.auth.uid));
+      }
+      allow get: if payloadReader();
+      allow create: if activeUser()
+        && getAfter(/databases/$(database)/documents/appointments/$(id)).data.get('patientKind','account') == 'account'
+        && request.resource.data.keys().hasOnly(['appointmentId', 'reason', 'createdAt', 'authorId'])
+        && request.resource.data.keys().hasAll(['appointmentId', 'reason', 'createdAt', 'authorId'])
+        && request.resource.data.appointmentId == id
+        && encrypted(request.resource.data.reason, [getAfter(/databases/$(database)/documents/appointments/$(id)).data.patientId, getAfter(/databases/$(database)/documents/appointments/$(id)).data.providerId])
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.authorId == request.auth.uid
+        && !exists(/databases/$(database)/documents/appointments/$(id))
+        && getAfter(/databases/$(database)/documents/appointments/$(id)).data.createdAt == request.time
+        && bookingCreate(getAfter(/databases/$(database)/documents/appointments/$(id)).data);
+      allow list, update, delete: if false;
+    }
+
+    // Trusted synthetic configuration. No client can set a clinic offset or
+    // wait estimate. The state contains only anonymous ticket numbers.
+    match /queue_configs/{clinicId} {
+      allow get: if activeUser() && activeClinic(clinicId)
+        && (!exists(/databases/$(database)/documents/queue_configs/$(clinicId)) || resource.data.clinicId == clinicId && configuredQueue(clinicId));
+      allow create: if (platformAdmin() || clinicAdmin(clinicId,'operational.read'))
+        && request.resource.data.keys().hasOnly(['clinicId','status','utcOffsetMinutes','estimateMinutesPerPatient'])
+        && request.resource.data.clinicId == clinicId && request.resource.data.status == 'active'
+        && getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.status == 'active'
+        && getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.timezone in ['Africa/Johannesburg','UTC']
+        && request.resource.data.utcOffsetMinutes == (getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.timezone == 'UTC' ? 0 : 120)
+        && request.resource.data.estimateMinutesPerPatient is int
+        && request.resource.data.estimateMinutesPerPatient >= 1 && request.resource.data.estimateMinutesPerPatient <= 120;
+      allow update: if (platformAdmin() || clinicAdmin(clinicId,'operational.read'))
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estimateMinutesPerPatient'])
+        && request.resource.data.estimateMinutesPerPatient is int
+        && request.resource.data.estimateMinutesPerPatient >= 1 && request.resource.data.estimateMinutesPerPatient <= 120;
+      allow list, delete: if false;
+    }
+
+    // Immutable minimal schedule projection; no private clinic contacts.
+    match /clinic_schedules/{clinicId} {
+      allow get: if activeUser() && activeClinic(clinicId);
+      allow create: if (platformAdmin() || clinicAdmin(clinicId,'operational.read'))
+        && request.resource.data == {'clinicId':clinicId,
+          'slotMinutes':getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.slotMinutes,
+          'timezone':getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.timezone};
+      allow list, update, delete: if false;
+    }
+
+    // An operational observer link is self-owned and validated against an
+    // existing appointment. It grants anonymous queue-state reads only.
+    function patientQueueObserver(stateId) {
+      let observer = get(/databases/$(database)/documents/queue_observers/$(stateId)/patients/$(request.auth.uid)).data;
+      let appointment = get(/databases/$(database)/documents/appointments/$(observer.appointmentId)).data;
+      return appointment.patientId == request.auth.uid
+        && appointment.status in ['booked', 'checked_in', 'called', 'completed']
+        && configuredQueue(appointment.clinicId)
+        && activeDoctor(appointment.clinicId, appointment.providerId)
+        && stateId == queueStateId(appointment)
+        && sameQueueDay(appointment);
+    }
+    match /queue_observers/{stateId}/patients/{uid} {
+      allow get: if activeUser() && request.auth.uid == uid;
+      allow create, update: if activeUser() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['appointmentId'])
+        && request.resource.data.keys().hasAll(['appointmentId'])
+        && validId(request.resource.data.appointmentId)
+        && get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.patientId == uid
+        && get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.status in ['booked', 'checked_in', 'called', 'completed']
+        && configuredQueue(get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.clinicId)
+        && activeDoctor(get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.clinicId,
+          get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.providerId)
+        && sameQueueDay(get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data)
+        && stateId == queueStateId(get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data);
+      allow list, delete: if false;
+    }
+    match /queue_states/{id} {
+      allow get: if activeUser() && (
+        !exists(/databases/$(database)/documents/queue_states/$(id))
+        || resource.data.providerId == request.auth.uid
+          && activeDoctor(resource.data.clinicId, request.auth.uid)
+        || clinicAdmin(resource.data.clinicId, 'operational.read')
+        || patientQueueObserver(id));
+      allow list: if false;
+      allow create: if activeUser() && validQueueState(request.resource.data, id)
+        && configuredQueue(request.resource.data.clinicId)
+        && activeDoctor(request.resource.data.clinicId, request.resource.data.providerId)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.nextTicket == 2
+        && request.resource.data.waiting == [1]
+        && request.resource.data.activeTicket == 0
+        && request.resource.data.changedTicket == 1
+        && request.resource.data.headTicket == 1
+        && queueChangeMatches(id, 1, 'waiting');
+      allow update: if activeUser() && validQueueState(resource.data, id)
+        && validQueueState(request.resource.data, id)
+        && configuredQueue(resource.data.clinicId)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['nextTicket', 'waiting', 'activeTicket', 'headTicket',
+            'changedTicket', 'updatedAt'])
+        && (skipCancelledHead(id) || validHeadChange(resource.data, request.resource.data)
+          && (request.resource.data.nextTicket == resource.data.nextTicket + 1
+          && resource.data.waiting.size() < 100
+          && request.resource.data.waiting
+            == resource.data.waiting.concat([resource.data.nextTicket])
+          && request.resource.data.activeTicket == resource.data.activeTicket
+          && request.resource.data.changedTicket == resource.data.nextTicket
+          && queueChangeMatches(id, resource.data.nextTicket, 'waiting')
+          || request.resource.data.nextTicket == resource.data.nextTicket
+            && request.resource.data.activeTicket == resource.data.activeTicket
+            && resource.data.waiting.hasAny([request.resource.data.changedTicket])
+            && request.resource.data.waiting == resource.data.waiting.removeAll(
+              [request.resource.data.changedTicket])
+            && queueChangeMatches(id, request.resource.data.changedTicket, 'cancelled')
+          || request.resource.data.nextTicket == resource.data.nextTicket
+            && resource.data.activeTicket == 0
+            && resource.data.waiting.size() > 0
+            && request.resource.data.changedTicket == resource.data.waiting[0]
+            && request.resource.data.activeTicket == resource.data.headTicket
+            && request.resource.data.headTicket == resource.data.headTicket + 1
+            && request.resource.data.activeTicket == resource.data.waiting[0]
+            && request.resource.data.waiting == resource.data.waiting.removeAll(
+              [resource.data.waiting[0]])
+            && queueChangeMatches(id, resource.data.waiting[0], 'called')
+          || request.resource.data.nextTicket == resource.data.nextTicket
+            && resource.data.activeTicket > 0
+            && request.resource.data.changedTicket == resource.data.activeTicket
+            && request.resource.data.activeTicket == 0
+            && request.resource.data.waiting == resource.data.waiting
+            && queueChangeMatches(id, resource.data.activeTicket, 'completed')));
+      allow delete: if false;
+    }
+    match /queues/{id} {
+      allow get: if activeUser() && validQueue(resource.data, id)
+          && (resource.data.patientId == request.auth.uid
+            || get(/databases/$(database)/documents/appointments/$(resource.data.appointmentId)).data.get('patientKind','account') == 'staff_managed'
+              && staffPatientManager(resource.data.clinicId)
+            || resource.data.providerId == request.auth.uid
+              && activeDoctor(resource.data.clinicId, request.auth.uid));
+      allow list: if boundedQuery()
+        && activeUser()
+        && resource.data.providerId == request.auth.uid
+        && activeDoctor(resource.data.clinicId, request.auth.uid);
+      allow create: if activeUser() && validQueue(request.resource.data, id)
+        && checkInActor(get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data)
+        && request.resource.data.status == 'waiting'
+        && request.resource.data.checkedInAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && configuredQueue(request.resource.data.clinicId)
+        && get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.status == 'booked'
+        && get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data.patientId == request.resource.data.patientId
+        && queueAppointmentMatches(request.resource.data)
+        && request.resource.data.stateId == queueStateId(
+          get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data)
+        && sameQueueDay(get(/databases/$(database)/documents/appointments/$(request.resource.data.appointmentId)).data)
+        && getAfter(/databases/$(database)/documents/queue_states/$(request.resource.data.stateId)).data.changedTicket == request.resource.data.ticket
+        && getAfter(/databases/$(database)/documents/queue_states/$(request.resource.data.stateId)).data.waiting.hasAny([request.resource.data.ticket]);
+      allow update: if activeUser() && validQueue(resource.data, id)
+        && validQueue(request.resource.data, id)
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updatedAt', 'cancelledAt', 'calledAt', 'completedAt'])
+        && queueAppointmentMatches(request.resource.data)
+        && queueStateMoved(request.resource.data)
+        && (resource.data.status == 'waiting'
+          && request.resource.data.status == 'cancelled'
+          && checkInActor(get(/databases/$(database)/documents/appointments/$(resource.data.appointmentId)).data)
+          && request.resource.data.cancelledAt == request.time
+          || resource.data.status == 'waiting'
+            && request.resource.data.status == 'called'
+            && resource.data.providerId == request.auth.uid
+            && activeDoctor(resource.data.clinicId, resource.data.providerId)
+            && request.resource.data.calledAt == request.time
+          || resource.data.status == 'called'
+            && request.resource.data.status == 'completed'
+            && resource.data.providerId == request.auth.uid
+            && activeDoctor(resource.data.clinicId, resource.data.providerId)
+            && request.resource.data.completedAt == request.time);
+      allow delete: if false;
+    }
+    function activeSpecialist(clinicId, specialistId) {
+      let member = get(/databases/$(database)/documents/clinic_memberships/$(clinicId)/members/$(specialistId)).data;
+      return (request.auth.uid != specialistId || staffAuthentication())
+        && activeClinic(clinicId) && member.clinicId == clinicId
+        && member.userId == specialistId && member.staffRole == 'specialist'
+        && member.status == 'active' && 'operational.read' in member.permissions;
+    }
+
+    function approvedSpecialist(clinicId, specialistId) {
+      let listing = get(/databases/$(database)/documents/specialist_listings/$(clinicId + '-' + specialistId)).data;
+      return listing.listingId == clinicId + '-' + specialistId
+        && listing.clinicId == clinicId && listing.specialistId == specialistId
+        && listing.status == 'active'
+        && textWithin(listing.displayName, 2, 100);
+    }
+
+    function validReferral(data, id) {
+      return referralMetadata(data, id) && (textWithin(data.reason, 1, 200) || referralEncrypted(data.reason, data));
+    }
+    function referralMetadata(data, id) {
+      return validId(id)
+        && data.keys().hasOnly(['referralId', 'clinicId', 'patientId',
+          'referringDoctorId', 'specialistId', 'sourceAppointmentId',
+          'priority', 'reason', 'status', 'createdAt', 'updatedAt',
+          'decisionAt', 'rejectionReason', 'completedAt', 'destinationClinicId', 'consentVersion', 'visitAccess', 'visitAccessRevokedAt'])
+        && data.keys().hasAll(['referralId', 'clinicId', 'patientId',
+          'referringDoctorId', 'specialistId', 'sourceAppointmentId',
+          'priority', 'reason', 'status', 'createdAt', 'updatedAt'])
+        && data.referralId == id && validId(data.clinicId)
+        && validId(data.patientId) && validId(data.referringDoctorId)
+        && validId(data.specialistId) && validId(data.sourceAppointmentId)
+        && data.referringDoctorId != data.specialistId
+        && data.priority in ['routine', 'urgent']
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && (!data.keys().hasAny(['destinationClinicId', 'consentVersion'])
+          || validId(data.destinationClinicId) && data.consentVersion is int && data.consentVersion > 0)
+        && (data.status == 'pending'
+          && !data.keys().hasAny(['decisionAt', 'rejectionReason', 'completedAt'])
+          || data.status == 'accepted' && data.decisionAt is timestamp
+            && !data.keys().hasAny(['rejectionReason', 'completedAt'])
+          || data.status == 'rejected' && data.decisionAt is timestamp
+            && (textWithin(data.rejectionReason, 1, 160) || referralEncrypted(data.rejectionReason, data))
+            && !data.keys().hasAny(['completedAt'])
+          || data.status == 'completed' && data.decisionAt is timestamp
+            && data.completedAt is timestamp
+            && !data.keys().hasAny(['rejectionReason']));
+    }
+
+    function referralRead(data, id) {
+      return activeUser() && validReferral(data, id)
+        && referralAuthority(data,id);
+    }
+    function referralAuthority(data,id) {
+      return data.referralId == id && (data.patientId == request.auth.uid
+          || data.referringDoctorId == request.auth.uid
+            && activeDoctor(data.clinicId, request.auth.uid)
+            && care(data.clinicId, data.patientId, 'appointment', data.sourceAppointmentId)
+          || data.specialistId == request.auth.uid
+            && (data.keys().hasAny(['destinationClinicId']) ? namedReferralAccess(data)
+              : activeSpecialist(data.clinicId, request.auth.uid)
+                && careFor(data.clinicId, data.patientId, request.auth.uid, 'referral', id)));
+    }
+
+    function referralSource(data) {
+      let appointment = get(/databases/$(database)/documents/appointments/$(data.sourceAppointmentId)).data;
+      return appointment.appointmentId == data.sourceAppointmentId
+        && appointment.clinicId == data.clinicId
+        && appointment.patientId == data.patientId
+        && appointment.providerId == data.referringDoctorId
+        && appointment.status in ['called', 'completed'];
+    }
+
+    function inboxMatches(data, id) {
+      let inbox = getAfter(/databases/$(database)/documents/referral_inbox/$(id)).data;
+      return inbox.referralId == id && inbox.clinicId == referralDestination(data)
+        && inbox.specialistId == data.specialistId;
+    }
+
+    // Nonclinical operational projection. Both directions require the pair;
+    // administrators can count referrals without reading a reason or patient ID.
+    function operationsShape(data, id) {
+      return {'referralId': id, 'clinicId': data.clinicId,
+        'destinationClinicId': data.destinationClinicId,
+        'status': data.status, 'updatedAt': data.updatedAt};
+    }
+    function operationsAtClinic(data, id, clinicId) {
+      return getAfter(/databases/$(database)/documents/clinic_referral_operations/$(clinicId)/items/$(id)).data
+        == operationsShape(data, id);
+    }
+    function referralOperationsMatch(data, id) {
+      return operationsAtClinic(data, id, data.clinicId)
+        && (data.clinicId == data.destinationClinicId
+          || operationsAtClinic(data, id, data.destinationClinicId));
+    }
+
+    match /clinic_referral_operations/{clinicId}/items/{id} {
+      function namedOperationalRecipient() {
+        let referral = get(/databases/$(database)/documents/referrals/$(id)).data;
+        return activeUser() && resource.data.referralId == id
+          && clinicId == referralDestination(referral)
+          && referral.specialistId == request.auth.uid
+          && activeSpecialist(clinicId,request.auth.uid);
+      }
+      // Exact, already-assigned metadata only: no patient ID, reason or content.
+      allow get: if clinicAdmin(clinicId, 'operational.read') || namedOperationalRecipient();
+      allow list: if boundedQuery() && clinicAdmin(clinicId, 'operational.read');
+      function pairedMutation() {
+        let after = getAfter(/databases/$(database)/documents/referrals/$(id)).data;
+        // The referral rule authenticates and authorises the shared request.
+        // Map equality enforces the entire projection with no extra fields.
+        return request.resource.data == operationsShape(after, id)
+          && clinicId in [after.clinicId, after.destinationClinicId]
+          && after.updatedAt == request.time
+          && (!exists(/databases/$(database)/documents/referrals/$(id))
+            || get(/databases/$(database)/documents/referrals/$(id)).data.status != after.status);
+      }
+      allow create, update: if pairedMutation();
+      allow delete: if false;
+    }
+
+    function referralCreate(id) {
+      let data = request.resource.data;
+      return activeUser() && validReferral(data, id)
+        && !data.keys().hasAny(['visitAccess','visitAccessRevokedAt'])
+        && data.status == 'pending' && data.referringDoctorId == request.auth.uid
+        && data.createdAt == request.time && data.updatedAt == request.time
+        && activeDoctor(data.clinicId, request.auth.uid)
+        && care(data.clinicId, data.patientId, 'appointment', data.sourceAppointmentId)
+        && get(/databases/$(database)/documents/users/$(data.patientId)).data.status == 'active'
+        // Exact appointment identity/provider/status already proved by the
+        // mandatory care(...,'appointment',sourceAppointmentId) above.
+        && (!data.keys().hasAny(['destinationClinicId'])
+          || get(/databases/$(database)/documents/patient_controls/$(data.patientId)).data.consentVersion == data.consentVersion)
+        && !exists(/databases/$(database)/documents/referral_inbox/$(id))
+        && inboxMatches(data, id)
+        && (!data.keys().hasAny(['destinationClinicId']) || referralOperationsMatch(data, id));
+    }
+
+    // Both documents must be new and written together. Validate the recipient
+    // on the inbox write to stay within Firestore's per-document read budget.
+    function referralInboxCreate(id) {
+      let data = request.resource.data;
+      let referral = getAfter(/databases/$(database)/documents/referrals/$(id)).data;
+      // A new paired referral authenticates the shared caller. No existing or
+      // standalone inbox can pass !exists + getAfter in this atomic operation.
+      return validId(id)
+        && data.keys().hasOnly(['referralId', 'clinicId', 'specialistId', 'patientId'])
+        && data.keys().hasAll(['referralId', 'clinicId', 'specialistId'])
+        && data.referralId == id
+        && !exists(/databases/$(database)/documents/referrals/$(id))
+        && referralDestination(referral) == data.clinicId
+        && referral.specialistId == data.specialistId
+        && (!data.keys().hasAny(['patientId']) || data.patientId == referral.patientId)
+        && referral.referringDoctorId == request.auth.uid
+        && activeSpecialist(data.clinicId, data.specialistId)
+        && approvedSpecialist(data.clinicId, data.specialistId)
+        && get(/databases/$(database)/documents/users/$(data.specialistId)).data.status == 'active';
+    }
+
+    match /referral_inbox/{id} {
+      function patientSchedulingPointer() {
+        let referral = get(/databases/$(database)/documents/referrals/$(id)).data;
+        let after = request.resource.data;
+        return activeUser() && referral.patientId == request.auth.uid
+          && referral.referralId == id && referral.status == 'accepted'
+          && resource.data.referralId == id
+          && resource.data.clinicId == referralDestination(referral)
+          && resource.data.specialistId == referral.specialistId
+          && after.diff(resource.data).affectedKeys().hasOnly(['patientId'])
+          && after.patientId == referral.patientId;
+      }
+      allow get: if activeUser() && resource.data.referralId == id
+        && resource.data.specialistId == request.auth.uid
+        && activeSpecialist(resource.data.clinicId, request.auth.uid);
+      allow list: if activeUser() && boundedQuery()
+        && resource.data.specialistId == request.auth.uid
+        && activeSpecialist(resource.data.clinicId, request.auth.uid);
+      allow create: if referralInboxCreate(id);
+      // A patient may add only their own immutable scheduling identity to an
+      // older pointer. No recipient/clinic/content/clinical grant can change.
+      allow update: if patientSchedulingPointer();
+      allow delete: if false;
+    }
+
+    function operationalReferralCompletion(id) {
+      let before = resource.data;
+      let after = request.resource.data;
+      return activeUser() && before.referralId == id && before.status == 'accepted'
+        && after.status == 'completed' && before.specialistId == request.auth.uid
+        && activeSpecialist(referralDestination(before),request.auth.uid)
+        && after.diff(before).affectedKeys().hasOnly(['status','completedAt','updatedAt'])
+        && after.completedAt == request.time && after.updatedAt == request.time
+        && (!exists(/databases/$(database)/documents/specialist_appointments/$(id))
+          || get(/databases/$(database)/documents/specialist_appointments/$(id)).data.status in ['cancelled','completed'])
+        && (!before.keys().hasAny(['destinationClinicId']) || referralOperationsMatch(after,id));
+    }
+    match /referrals/{id} {
+      function recipientDecision() {
+        let before = resource.data;
+        let after = request.resource.data;
+        // The original reason is immutable in this transition. Validate its
+        // metadata and the new decision ciphertext without revalidating the
+        // unchanged original ciphertext (which has its own create/read checks).
+        return activeUser() && referralMetadata(before,id)
+          && (!before.keys().hasAny(['destinationClinicId']) || referralOperationsMatch(after,id))
+          && before.specialistId == request.auth.uid
+          && (before.keys().hasAny(['destinationClinicId']) ? namedReferralAccess(before)
+            : activeSpecialist(before.clinicId,request.auth.uid)
+              && careFor(before.clinicId,before.patientId,request.auth.uid,'referral',id))
+          && after.updatedAt == request.time && before.status == 'pending'
+          && after.decisionAt == request.time
+          && (after.status == 'accepted'
+              && after.diff(before).affectedKeys().hasOnly(['status','decisionAt','updatedAt'])
+            || after.status == 'rejected' && referralEncrypted(after.rejectionReason,before)
+              && after.diff(before).affectedKeys().hasOnly(['status','decisionAt','rejectionReason','updatedAt']));
+      }
+      allow get: if referralRead(resource.data, id);
+      allow list: if boundedQuery() && activeUser()
+        && (resource.data.patientId == request.auth.uid
+          || resource.data.referringDoctorId == request.auth.uid
+            && activeDoctor(resource.data.clinicId, request.auth.uid)
+            && care(resource.data.clinicId, resource.data.patientId, 'appointment', resource.data.sourceAppointmentId));
+      // validReferral performs the full ciphertext/envelope validation once.
+      // Legacy strings remain readable, but cannot be written by new clients.
+      allow create: if request.resource.data.reason is map
+        && providerAccountActive(request.resource.data.specialistId) && referralCreate(id);
+      allow update: if request.resource.data.status == resource.data.status
+        ? (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visitAccess'])
+          ? patientVisitApproval(resource.data,request.resource.data)
+          : activeUser() && resource.data.status in ['accepted','completed'] && request.auth.uid in [resource.data.patientId,resource.data.specialistId]
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visitAccessRevokedAt'])
+            && request.resource.data.visitAccessRevokedAt == request.time)
+        : request.resource.data.status == 'completed' ? operationalReferralCompletion(id)
+        : recipientDecision();
+      allow delete: if false;
+    }
+    function specialistScheduleManager(clinicId, uid) {
+      return activeUser() && activeSpecialist(clinicId,uid)
+        && (request.auth.uid == uid || clinicAdmin(clinicId,'operational.read'));
+    }
+    function specialistAppointmentRead(data) {
+      return activeUser() && (data.patientId == request.auth.uid
+        || data.providerId == request.auth.uid && activeSpecialist(data.clinicId,request.auth.uid)
+        || clinicAdmin(data.clinicId,'operational.read'));
+    }
+    function specialistAppointmentShape(data,id) {
+      return data.keys().hasOnly(['referralId','clinicId','providerId','patientId','slotId','startAt','endAt','status','revision','bookedBy','updatedBy','createdAt','updatedAt'])
+        && data.referralId == id && validId(id) && validId(data.clinicId) && validId(data.providerId)
+        && validId(data.patientId) && validId(data.slotId) && validId(data.bookedBy) && validId(data.updatedBy)
+        && data.startAt is timestamp && data.endAt is timestamp && data.endAt > data.startAt
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && data.revision is int && data.revision >= 1 && data.revision <= 1000
+        && data.status in ['booked','cancelled','completed'];
+    }
+    function specialistReferralBooking(data,id) {
+      // getAfter also supports the specialist's atomic accept-and-reserve action.
+      let referral = getAfter(/databases/$(database)/documents/referrals/$(id)).data;
+      let consent = get(/databases/$(database)/documents/patient_controls/$(data.patientId)).data;
+      return activeUser() && request.auth.uid in [data.patientId,data.providerId]
+        && providerAccountActive(data.providerId)
+        && referral.referralId == id && referral.status == 'accepted'
+        && referral.patientId == data.patientId && referral.specialistId == data.providerId
+        && referralDestination(referral) == data.clinicId
+        // Operational reservation only; no extension of clinical authority.
+        && data.startAt <= request.time + duration.value(90,'d')
+        && data.startAt > request.time
+        // Destination specialist membership/listing are checked by the NEW
+        // mandatory slot reservation; the immutable version checks this source
+        // context. Both are required by the main appointment in the same batch.
+        && activeDoctor(referral.clinicId,referral.referringDoctorId) && referralSource(referral)
+        && get(/databases/$(database)/documents/users/$(data.patientId)).data.status == 'active'
+        && consent.patientId == data.patientId && consent.status == 'consented'
+        && consent.consentVersion == referral.consentVersion;
+    }
+    function specialistReservation(data,id) {
+      let before = get(/databases/$(database)/documents/specialist_slots/$(data.slotId)).data;
+      let after = getAfter(/databases/$(database)/documents/specialist_slots/$(data.slotId)).data;
+      return before.status == 'available' && after.status == 'booked'
+        && after.appointmentId == id && after.patientId == data.patientId
+        && slotMatchesAppointment(after,data) && after.updatedAt == request.time;
+    }
+    function specialistRelease(data,id) {
+      let before = get(/databases/$(database)/documents/specialist_slots/$(data.slotId)).data;
+      let after = getAfter(/databases/$(database)/documents/specialist_slots/$(data.slotId)).data;
+      return before.status == 'booked' && before.appointmentId == id && before.patientId == data.patientId
+        && after.status == 'available' && !after.keys().hasAny(['appointmentId','patientId'])
+        && after.updatedAt == request.time;
+    }
+    function specialistVersionPair(data,id) {
+      return getAfter(/databases/$(database)/documents/specialist_appointment_versions/$(id + '-v' + string(data.revision))).data == data;
+    }
+    match /specialist_slots/{id} {
+      function readable() {
+        return activeUser() && (specialistScheduleManager(resource.data.clinicId,resource.data.providerId)
+          || resource.data.status == 'available' && activeSpecialist(resource.data.clinicId,resource.data.providerId)
+            && approvedSpecialist(resource.data.clinicId,resource.data.providerId)
+          || resource.data.status == 'booked' && resource.data.patientId == request.auth.uid);
+      }
+      allow get: if validSlot(resource.data,id) && readable();
+      allow list: if boundedQuery() && readable();
+      allow create: if validSlot(request.resource.data,id) && request.resource.data.status in ['available','unavailable']
+        && request.resource.data.startAt > request.time && request.resource.data.updatedAt == request.time
+        && request.resource.data.endAt == request.resource.data.startAt + duration.value(get(/databases/$(database)/documents/clinics/$(request.resource.data.clinicId)).data.slotMinutes,'m')
+        && specialistScheduleManager(request.resource.data.clinicId,request.resource.data.providerId);
+      function bookedPair() {
+        let after = getAfter(/databases/$(database)/documents/specialist_appointments/$(request.resource.data.appointmentId)).data;
+        return resource.data.status == 'available' && request.resource.data.status == 'booked'
+          && activeUser() && activeSpecialist(resource.data.clinicId,resource.data.providerId)
+          && approvedSpecialist(resource.data.clinicId,resource.data.providerId)
+          && after.status == 'booked' && after.slotId == id && after.updatedAt == request.time
+          && after.patientId == request.resource.data.patientId && after.referralId == request.resource.data.appointmentId
+          && slotMatchesAppointment(request.resource.data,after);
+      }
+      function releasedPair() {
+        let before = get(/databases/$(database)/documents/specialist_appointments/$(resource.data.appointmentId)).data;
+        let after = getAfter(/databases/$(database)/documents/specialist_appointments/$(resource.data.appointmentId)).data;
+        return resource.data.status == 'booked' && request.resource.data.status == 'available'
+          && before.slotId == id && before.patientId == resource.data.patientId
+          && after.revision == before.revision + 1 && after.updatedAt == request.time
+          && (after.status in ['cancelled','completed'] || after.status == 'booked' && after.slotId != id);
+      }
+      allow update: if validSlot(resource.data,id) && validSlot(request.resource.data,id)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','appointmentId','patientId','updatedAt'])
+        && request.resource.data.updatedAt == request.time
+        && (resource.data.startAt > request.time && resource.data.status in ['available','unavailable']
+            && request.resource.data.status in ['available','unavailable'] && specialistScheduleManager(resource.data.clinicId,resource.data.providerId)
+          || bookedPair() || releasedPair());
+      allow delete: if false;
+    }
+    match /specialist_appointments/{id} {
+      allow get: if activeUser() && (exists(/databases/$(database)/documents/specialist_appointments/$(id)) ? specialistAppointmentRead(resource.data)
+        : get(/databases/$(database)/documents/referrals/$(id)).data.patientId == request.auth.uid
+          || get(/databases/$(database)/documents/referrals/$(id)).data.specialistId == request.auth.uid);
+      allow list: if boundedQuery() && specialistAppointmentRead(resource.data);
+      allow create: if activeUser() && specialistAppointmentShape(request.resource.data,id)
+        && request.resource.data.status == 'booked' && request.resource.data.revision == 1
+        && request.resource.data.bookedBy == request.auth.uid && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+        && specialistReservation(request.resource.data,id) && specialistVersionPair(request.resource.data,id);
+      allow update: if specialistAppointmentShape(request.resource.data,id)
+        && request.resource.data.updatedAt == request.time && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.revision == resource.data.revision + 1
+        && specialistVersionPair(request.resource.data,id)
+        && getAfter(/databases/$(database)/documents/referrals/$(id)).data.visitAccessRevokedAt == request.time
+        && (request.resource.data.status == 'booked' && resource.data.status in ['booked','cancelled']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['slotId','startAt','endAt','status','revision','updatedBy','updatedAt'])
+          && specialistReservation(request.resource.data,id)
+          && (resource.data.status == 'cancelled' || resource.data.startAt > request.time && specialistRelease(resource.data,id))
+        || resource.data.status == 'booked' && request.resource.data.status in ['cancelled','completed']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','revision','updatedBy','updatedAt'])
+          && activeUser() && (request.resource.data.status == 'cancelled' && request.auth.uid == resource.data.patientId
+            || activeSpecialist(resource.data.clinicId,resource.data.providerId))
+          && (request.resource.data.status == 'cancelled' && request.auth.uid in [resource.data.patientId,resource.data.providerId] && resource.data.startAt > request.time
+            || request.resource.data.status == 'completed' && request.auth.uid == resource.data.providerId && resource.data.startAt <= request.time)
+          && specialistRelease(resource.data,id));
+      allow delete: if false;
+    }
+    match /specialist_appointment_versions/{id} {
+      allow get: if specialistAppointmentRead(resource.data);
+      allow list: if boundedQuery() && specialistAppointmentRead(resource.data);
+      allow create: if activeUser() && id == request.resource.data.referralId + '-v' + string(request.resource.data.revision)
+        && (request.resource.data.status != 'booked' || specialistReferralBooking(request.resource.data,request.resource.data.referralId))
+        && getAfter(/databases/$(database)/documents/specialist_appointments/$(request.resource.data.referralId)).data == request.resource.data
+        && request.resource.data.updatedAt == request.time
+        && (!exists(/databases/$(database)/documents/specialist_appointments/$(request.resource.data.referralId)) && request.resource.data.revision == 1
+          || get(/databases/$(database)/documents/specialist_appointments/$(request.resource.data.referralId)).data.revision + 1 == request.resource.data.revision);
+      allow update,delete: if false;
+    }
+    function sharedMetadataReader(share) {
+      let referral = get(/databases/$(database)/documents/referrals/$(share.referralId)).data;
+      return activeUser() && (share.patientId == request.auth.uid
+        || share.specialistId == request.auth.uid && share.status == 'active'
+          && share.expiresAt > request.time && referral.status == 'accepted'
+          && referral.patientId == share.patientId && referral.specialistId == share.specialistId
+          && namedReferralAccess(referral));
+    }
+    // This grants only the monotonic head ID/revision, never future ciphertext.
+    match /record_head_readers/{root}/specialists/{specialist} {
+      function validReader(data) {
+        let share = getAfter(/databases/$(database)/documents/record_shares/$(data.shareId)).data;
+        let record = get(/databases/$(database)/documents/medical_records/$(share.recordId)).data;
+        return data == {'shareId':share.shareId,'rootRecordId':root,'referralId':share.referralId,
+            'patientId':share.patientId,'specialistId':share.specialistId,'destinationClinicId':share.destinationClinicId,
+            'status':share.status,'expiresAt':share.expiresAt}
+          && data.rootRecordId == root && record.get('rootRecordId',record.recordId) == root
+          && share.specialistId == specialist && share.patientId == request.auth.uid
+          && share.updatedAt == request.time;
+      }
+      allow create,update: if activeUser() && validReader(request.resource.data);
+      allow get: if activeUser() && (!exists(/databases/$(database)/documents/record_head_readers/$(root)/specialists/$(specialist)) || resource.data.patientId == request.auth.uid);
+      allow list,delete: if false;
+    }
+    match /record_share_details/{id} {
+      function validDetails(data) {
+        let share = getAfter(/databases/$(database)/documents/record_shares/$(id)).data;
+        let record = get(/databases/$(database)/documents/medical_records/$(share.recordId)).data;
+        return data.keys().hasOnly(['shareId','recordId','rootRecordId','visitAt','createdAt','recordType','attribution'])
+          && data == {'shareId':id,'recordId':record.recordId,'rootRecordId':record.get('rootRecordId',record.recordId),
+            'visitAt':record.visitAt,'createdAt':record.createdAt,'recordType':record.recordType,
+            'attribution': exists(/databases/$(database)/documents/record_attribution/$(record.recordId)) ? get(/databases/$(database)/documents/record_attribution/$(record.recordId)).data : {'recordId':record.recordId}}
+          && share.patientId == request.auth.uid && share.updatedAt == request.time && share.status == 'active';
+      }
+      allow create: if activeUser() && validDetails(request.resource.data);
+      allow update: if activeUser() && validDetails(request.resource.data) && request.resource.data == resource.data;
+      allow get: if activeUser() && (!exists(/databases/$(database)/documents/record_share_details/$(id))
+        || sharedMetadataReader(get(/databases/$(database)/documents/record_shares/$(id)).data));
+      allow list,delete: if false;
+    }
+    match /record_shares/{id} {
+      function indexMatches(data) {
+        return getAfter(/databases/$(database)/documents/record_share_index/$(id)).data
+          == {'shareId':id,'referralId':data.referralId,'patientId':data.patientId,'specialistId':data.specialistId,'destinationClinicId':data.destinationClinicId,'status':data.status,'shareRevision':data.shareRevision,'updatedAt':data.updatedAt};
+      }
+      function shareRead(data) {
+        let referral = get(/databases/$(database)/documents/referrals/$(data.referralId)).data;
+        return activeUser() && encrypted(data.content, [data.specialistId])
+          && (data.patientId == request.auth.uid || data.specialistId == request.auth.uid
+            && data.status == 'active' && data.expiresAt > request.time
+            && referral.status == 'accepted' && referral.patientId == data.patientId
+            && referral.specialistId == data.specialistId && namedReferralAccess(referral));
+      }
+      function sourceCopy(data) {
+        let record = get(/databases/$(database)/documents/medical_records/$(data.recordId)).data;
+        let referral = get(/databases/$(database)/documents/referrals/$(data.referralId)).data;
+        return record.patientId == data.patientId && record.patientVisible == true
+          && record.authorId == data.authorId && record.authorId == referral.referringDoctorId
+          && record.clinicId == data.clinicId && record.clinicId == referral.clinicId
+          && record.encounterType == 'appointment' && data.encounterType == 'appointment'
+          && record.encounterId == data.encounterId && record.encounterId == referral.sourceAppointmentId
+          && record.revision == data.revision && record.content.payload == data.content.payload
+          && referral.referralId == data.referralId && referral.patientId == data.patientId
+          && referral.specialistId == data.specialistId && referral.status == 'accepted'
+          && referralDestination(referral) == data.destinationClinicId
+          && referralClinicalWindow(referral)
+          && activeDoctor(data.clinicId, referral.referringDoctorId)
+          && activeSpecialist(data.destinationClinicId, data.specialistId)
+          && referralSource(referral)
+          && get(/databases/$(database)/documents/patient_controls/$(data.patientId)).data.status == 'consented'
+          && get(/databases/$(database)/documents/patient_controls/$(data.patientId)).data.consentVersion == referral.consentVersion;
+      }
+      function readerFollows(data) {
+        let source = get(/databases/$(database)/documents/medical_records/$(data.recordId)).data;
+        let root = source.get('rootRecordId',source.recordId);
+        let path = /databases/$(database)/documents/record_head_readers/$(root)/specialists/$(data.specialistId);
+        return !exists(path) || get(path).data.shareId != id
+          || getAfter(path).data.status == data.status && getAfter(path).data.expiresAt == data.expiresAt;
+      }
+      function shareShape(data) {
+        return data.keys().hasOnly(['shareId','referralId','recordId','clinicId','patientId','authorId','encounterType','encounterId','revision','specialistId','destinationClinicId','status','createdAt','updatedAt','expiresAt','shareRevision','content'])
+          && validId(data.referralId) && validId(data.recordId)
+          && data.shareId == id && id == data.referralId + '-' + data.recordId
+          && data.patientId == request.auth.uid && data.status == 'active'
+          && data.createdAt is timestamp && data.updatedAt == request.time
+          && data.shareRevision is int && data.expiresAt is timestamp
+          && data.expiresAt > request.time && data.expiresAt <= request.time + duration.value(24,'h')
+          && encrypted(data.content,[data.specialistId]);
+      }
+      allow get: if activeUser() && (!exists(/databases/$(database)/documents/record_shares/$(id)) || shareRead(resource.data));
+      allow list: if false;
+      allow create: if activeUser() && shareShape(request.resource.data)
+        && request.resource.data.createdAt == request.time && request.resource.data.shareRevision == 1
+        && indexMatches(request.resource.data)
+        && sourceCopy(request.resource.data);
+      allow update: if activeUser() && resource.data.patientId == request.auth.uid
+        && request.resource.data.shareRevision == resource.data.shareRevision + 1
+        && request.resource.data.updatedAt == request.time
+        && indexMatches(request.resource.data) && readerFollows(request.resource.data)
+        && (request.resource.data.status == 'revoked'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt','shareRevision'])
+          || shareShape(request.resource.data) && sourceCopy(request.resource.data)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['content','status','expiresAt','updatedAt','shareRevision']));
+      allow delete: if false;
+    }
+    match /record_share_index/{id} {
+      allow get: if activeUser() && (resource.data.patientId == request.auth.uid
+        || resource.data.specialistId == request.auth.uid && activeSpecialist(resource.data.destinationClinicId,request.auth.uid));
+      allow list: if activeUser() && boundedQuery() && (resource.data.patientId == request.auth.uid
+        || resource.data.specialistId == request.auth.uid && activeSpecialist(resource.data.destinationClinicId,request.auth.uid));
+      function paired() {
+        let share = getAfter(/databases/$(database)/documents/record_shares/$(id)).data;
+        return request.resource.data == {'shareId':id,'referralId':share.referralId,'patientId':share.patientId,'specialistId':share.specialistId,'destinationClinicId':share.destinationClinicId,'status':share.status,'shareRevision':share.shareRevision,'updatedAt':share.updatedAt}
+          && share.patientId == request.auth.uid && share.updatedAt == request.time
+          && (!exists(/databases/$(database)/documents/record_shares/$(id))
+            || get(/databases/$(database)/documents/record_shares/$(id)).data.shareRevision + 1 == share.shareRevision);
+      }
+      allow create,update: if activeUser() && paired();
+      allow delete: if false;
+    }
+    // Written-record projections (31 October): no narrative, no public lists.
+    // encounter_labels: patient/clinic/encounter IDs, own validated displayName,
+    // server updatedAt. record_attribution: record ID and optional directory names.
+    match /encounter_labels/{id} {
+      function validLabel(data) {
+        return data.keys().hasOnly(['patientId','clinicId','encounterType','encounterId','displayName','updatedAt'])
+          && data.keys().hasAll(['patientId','clinicId','encounterType','encounterId','displayName','updatedAt'])
+          && validId(data.patientId) && validId(data.clinicId) && validId(data.encounterId)
+          && data.encounterType in ['appointment','referral']
+          && id == data.encounterType + '-' + data.encounterId
+          && textWithin(data.displayName,1,100) && data.updatedAt == request.time;
+      }
+      function labelSource(data) {
+        let appointment = get(/databases/$(database)/documents/appointments/$(data.encounterId)).data;
+        return appointment.patientId == data.patientId && appointment.clinicId == data.clinicId
+          && appointment.status in ['called','completed'];
+      }
+      function labelReferral(data) {
+        let referral = getAfter(/databases/$(database)/documents/referrals/$(data.encounterId)).data;
+        return referral.patientId == data.patientId && referralDestination(referral) == data.clinicId;
+      }
+      function labelWriter(data) {
+        return activeUser() && validLabel(data) && (
+          data.patientId == request.auth.uid
+            && data.displayName == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName
+            && (data.encounterType == 'appointment' ? labelSource(data) : labelReferral(data))
+          || data.encounterType == 'referral' && labelReferral(data)
+            && getAfter(/databases/$(database)/documents/referrals/$(data.encounterId)).data.referringDoctorId == request.auth.uid
+            && data.displayName == get(/databases/$(database)/documents/encounter_labels/$('appointment-' + getAfter(/databases/$(database)/documents/referrals/$(data.encounterId)).data.sourceAppointmentId)).data.displayName
+            && care(getAfter(/databases/$(database)/documents/referrals/$(data.encounterId)).data.clinicId, data.patientId, 'appointment', getAfter(/databases/$(database)/documents/referrals/$(data.encounterId)).data.sourceAppointmentId));
+      }
+      allow create: if labelWriter(request.resource.data);
+      allow update: if labelWriter(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName','updatedAt']);
+      allow get: if activeUser() && (!exists(/databases/$(database)/documents/encounter_labels/$(id))
+        || resource.data.patientId == request.auth.uid || practitionerSummaryRead(resource.data));
+      allow list,delete: if false;
+    }
+    match /record_attribution/{id} {
+      function validAttribution(data) {
+        let record = getAfter(/databases/$(database)/documents/medical_records/$(id)).data;
+        return data.keys().hasOnly(['recordId','clinicName','providerName']) && data.recordId == id
+          && record.authorId == request.auth.uid && record.createdAt == request.time
+          && !exists(/databases/$(database)/documents/medical_records/$(id))
+          && (!data.keys().hasAny(['clinicName']) || textWithin(data.clinicName,1,100)
+            && (data.clinicName == get(/databases/$(database)/documents/clinic_directory/$(record.clinicId)).data.displayName
+              || record.revision > 1 && data.clinicName == get(/databases/$(database)/documents/record_attribution/$(record.supersedesId)).data.clinicName))
+          && (!data.keys().hasAny(['providerName']) || textWithin(data.providerName,1,100)
+            && (data.providerName == get(/databases/$(database)/documents/provider_directory/$(record.authorId)).data.displayName
+              || record.revision > 1 && data.providerName == get(/databases/$(database)/documents/record_attribution/$(record.supersedesId)).data.providerName));
+      }
+      allow create: if activeUser() && validAttribution(request.resource.data);
+      allow get: if activeUser() && (!exists(/databases/$(database)/documents/record_attribution/$(id))
+        || get(/databases/$(database)/documents/medical_records/$(id)).data.patientId == request.auth.uid
+          && get(/databases/$(database)/documents/medical_records/$(id)).data.patientVisible
+        || practitionerSummaryRead(get(/databases/$(database)/documents/medical_records/$(id)).data));
+      allow list,update,delete: if false;
+    }
+    match /record_summaries/{id} {
+      function summaryRead() {
+        return activeUser() && validSummary(resource.data, id) && (
+          (patientOwner(resource.data) && resource.data.patientVisible == true)
+          || practitionerSummaryRead(resource.data)
+        );
+      }
+      allow get: if activeUser() && (!exists(/databases/$(database)/documents/record_summaries/$(id)) || summaryRead());
+      allow list: if boundedQuery() && activeUser() && (
+        (patientOwner(resource.data) && resource.data.patientVisible == true)
+        || practitionerSummaryRead(resource.data)
+      );
+      // A summary is only created with its matching clinical document.
+      // No client can add narrative or later change its visibility/status.
+      // Full metadata validation is performed by the inseparable new record.
+      // Equality below rejects omissions/forgeries; this allow-list excludes
+      // clinical fields while avoiding duplicate schema work in the same batch.
+      allow create: if summaryProjectionShape(request.resource.data)
+        && request.resource.data.authorId == request.auth.uid
+        && practitionerSummaryRead(request.resource.data)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && !exists(/databases/$(database)/documents/medical_records/$(id))
+        && matchingRecord(request.resource.data, id);
+      allow update, delete: if false;
+    }
+    match /medical_records/{id} {
+      function recordRead() {
+        return activeUser() && validRecord(resource.data, id) && (
+          (patientOwner(resource.data) && resource.data.patientVisible == true)
+          || practitionerSummaryRead(resource.data)
+        );
+      }
+      allow get: if recordRead();
+      allow list: if boundedQuery() && activeUser() && (
+        (patientOwner(resource.data) && resource.data.patientVisible == true)
+        || practitionerSummaryRead(resource.data)
+      );
+      // Final versions are immutable. Corrections create a new paired version
+      // and advance its monotonic head; they never update an original.
+      // Exact clinical authority is enforced by the inseparable new summary.
+      // !exists(summary) + getAfter metadata equality require its create rule
+      // (including current care/consent) to pass in this same atomic operation.
+      allow create: if validRecord(request.resource.data, id)
+        && validRecordVersion(request.resource.data, id)
+        && (request.resource.data.revision > 1 || encounterVisitDate(request.resource.data))
+        // validRecord already validates the full encrypted schema. This extra
+        // discriminator excludes its historical plaintext-read branch.
+        && request.resource.data.content.format == 'medisync-clinical-v1'
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && !exists(/databases/$(database)/documents/record_summaries/$(id))
+        && matchingSummary(request.resource.data, id);
+      allow update, delete: if false;
+    }
+
+    // Whole-document boundary: patient reads can never disclose this document.
+    // Only the named author with current exact encounter authority may read it.
+    match /internal_record_notes/{id} {
+      function noteReader() {
+        let record = get(/databases/$(database)/documents/medical_records/$(id)).data;
+        return activeUser() && record.authorId == request.auth.uid
+          && practitionerSummaryRead(record);
+      }
+      allow get: if noteReader();
+      // This new note requires the new medical record, whose mandatory new
+      // summary enforces exact clinical authority. No standalone note is valid.
+      allow create: if request.resource.data.authorId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['recordId', 'clinicId', 'patientId', 'authorId',
+          'status', 'recordType', 'patientVisible', 'revision', 'visitAt', 'encounterType',
+          'encounterId', 'createdAt', 'updatedAt', 'notes', 'rootRecordId', 'supersedesId', 'dateSource'])
+        && recordMetadata(request.resource.data, id)
+        && encrypted(request.resource.data.notes, [request.resource.data.authorId])
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && !exists(/databases/$(database)/documents/medical_records/$(id))
+        && matchingRecord(request.resource.data, id);
+      allow list, update, delete: if false;
+    }
+    // Account-wide data-rights requests have no clinic scope or clinical text.
+    // Only a trusted operator can later verify and fulfil an action; client
+    // Rules expose no completed status transition.
+    match /privacy_requests/{id} {
+      function requestShape(data) {
+        return validId(id)
+          && data.keys().hasOnly([
+            'requestId', 'userId', 'type', 'status', 'createdAt',
+            'updatedAt', 'reviewedBy', 'reviewedAt', 'resolvedAt', 'resolution', 'receiptId'
+          ])
+          && data.keys().hasAll([
+            'requestId', 'userId', 'type', 'status', 'createdAt', 'updatedAt'
+          ])
+          && data.requestId == id && validId(data.userId)
+          && data.type in ['access', 'correction', 'deletion']
+          && data.status in ['pending', 'under_review', 'fulfilled', 'partially_fulfilled', 'declined']
+          && data.createdAt is timestamp && data.updatedAt is timestamp;
+      }
+      allow get: if activeUser() && requestShape(resource.data)
+        && (resource.data.userId == request.auth.uid || platformAdmin());
+      allow list: if activeUser() && boundedQuery()
+        && (resource.data.userId == request.auth.uid || platformAdmin());
+      allow create: if activeUser() && requestShape(request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'requestId', 'userId', 'type', 'status', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update: if platformAdmin() && requestShape(resource.data)
+        && requestShape(request.resource.data)
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'under_review'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updatedAt', 'reviewedBy', 'reviewedAt'])
+        && request.resource.data.reviewedBy == request.auth.uid
+        && request.resource.data.reviewedAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+    match /access_logs/{id} {
+      allow get: if activeUser()
+        && clinicAdmin(resource.data.clinicId, 'audit.read');
+      allow list: if boundedQuery() && activeUser()
+        && clinicAdmin(resource.data.clinicId, 'audit.read');
+      allow write: if false;
+    }
+    match /privacy_receipts/{id} {
+      allow get: if activeUser() && (resource.data.userId == request.auth.uid || platformAdmin());
+      allow list,write: if false;
+    }
+    match /privacy_jobs/{id} { allow read,write: if false; }
+    match /operator_actions/{id} { allow read,write: if false; }
+    match /platform_metrics/{id} {
+      allow get: if id == 'current' && platformAdmin();
+      allow list,write: if false;
+    }
+
+    // Own, generic states observed by an online client. This is not a trusted
+    // delivery ledger or exhaustive audit. No arbitrary message text is stored.
+    match /notification_history/{uid}/items/{eventId} {
+      function shape(data) {
+        return data.keys().hasOnly(['kind','sourceId','status','sourceAt','role','clinicId','observedAt','read'])
+          && data.keys().hasAll(['kind','sourceId','status','sourceAt','role','clinicId','observedAt','read'])
+          && data.kind in ['appointment','referral','specialist']
+          && validId(data.sourceId) && data.sourceAt is timestamp
+          && data.observedAt is timestamp && data.read is bool
+          && (data.role == 'patient' && data.clinicId == ''
+            || data.role in ['doctor','specialist'] && validId(data.clinicId))
+          && (data.kind == 'appointment'
+              && data.role in ['patient','doctor']
+              && data.status in ['booked','cancelled','checked_in','called','completed','check_in_cancelled']
+            || data.kind == 'referral'
+              && data.status in ['pending','accepted','rejected','completed']
+            || data.kind == 'specialist' && data.role in ['patient','specialist']
+              && data.status in ['booked','cancelled','completed'])
+          && eventId == data.kind + '-' + data.sourceId + '-'
+            + string(data.sourceAt.toMillis()) + '-' + data.role + '-'
+            + (data.clinicId == '' ? 'own' : data.clinicId);
+      }
+      function sourceMatches(data) {
+        let source = data.kind == 'appointment'
+          ? get(/databases/$(database)/documents/appointments/$(data.sourceId)).data
+          : data.kind == 'referral'
+          ? get(/databases/$(database)/documents/referrals/$(data.sourceId)).data
+          : get(/databases/$(database)/documents/specialist_appointments/$(data.sourceId)).data;
+        return source.status == data.status && source.updatedAt == data.sourceAt
+          && (data.role == 'patient' && source.patientId == uid
+            || data.role == 'doctor' && data.kind == 'appointment'
+              && source.providerId == uid && source.clinicId == data.clinicId
+              && activeDoctor(data.clinicId,uid)
+            || data.role == 'doctor' && data.kind == 'referral'
+              && source.referringDoctorId == uid && source.clinicId == data.clinicId
+              && referralMetadata(source,data.sourceId) && referralAuthority(source,data.sourceId)
+            || data.role == 'specialist' && data.kind == 'referral'
+              && source.specialistId == uid && referralDestination(source) == data.clinicId
+              && referralMetadata(source,data.sourceId) && referralAuthority(source,data.sourceId)
+            || data.role == 'specialist' && data.kind == 'specialist'
+              && source.providerId == uid && source.clinicId == data.clinicId
+              && activeSpecialist(data.clinicId,uid));
+      }
+      allow get: if activeUser() && uid == request.auth.uid;
+      allow list: if activeUser() && uid == request.auth.uid && boundedQuery();
+      allow create: if activeUser() && uid == request.auth.uid
+        && shape(request.resource.data) && sourceMatches(request.resource.data)
+        && request.resource.data.observedAt == request.time
+        && request.resource.data.read == false;
+      allow update: if activeUser() && uid == request.auth.uid
+        && shape(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
